@@ -119,6 +119,36 @@ describe("tangem-gacha-vault", () => {
     vault2Usdc = getAssociatedTokenAddressSync(usdcMint, vault2Pda, true);
   });
 
+  it("initialize_config: rejects an admin that is not the upgrade authority", async () => {
+    // Front-running protection: only the program's upgrade authority may
+    // initialize the config (program_data.upgrade_authority_address == admin).
+    try {
+      await program.methods
+        .initializeConfig(
+          gachaWallet.publicKey,
+          gachaUsdc,
+          feeUsdc,
+          FEE_BPS,
+          true
+        )
+        .accountsPartial({
+          config: configPda,
+          usdcMint,
+          admin: attacker.publicKey, // <-- not the upgrade authority
+          program: program.programId,
+          programData: programDataPda,
+          systemProgram: SystemProgram.programId,
+        })
+        .signers([attacker])
+        .rpc();
+      assert.fail("should have thrown");
+    } catch (e: any) {
+      assert.include(e.toString(), "Unauthorized");
+    }
+    // Nothing was written — the positive init below still starts from scratch.
+    assert.isNull(await program.account.config.fetchNullable(configPda));
+  });
+
   it("initializes config (upgrade authority only)", async () => {
     await program.methods
       .initializeConfig(

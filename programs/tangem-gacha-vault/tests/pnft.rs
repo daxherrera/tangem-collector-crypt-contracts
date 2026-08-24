@@ -37,6 +37,10 @@ const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA
 const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 /// Solana packet limit; the serialized transaction must stay under this.
 const PACKET_DATA_SIZE: usize = 1232;
+/// The reconciliation key CC's matcher greps for — carried BOTH as the
+/// buyback instruction argument (recorded in BuybackExecuted) and as a
+/// top-level SPL Memo instruction in the same transaction.
+const CC_BUYBACK_MEMO: &str = "dev-00000000-1111-2222-3333-444444444444:buyback";
 
 fn fixture(name: &str) -> String {
     format!(
@@ -202,6 +206,17 @@ fn cc_memo_ix(w: &World, text: &str) -> Instruction {
     }
 }
 
+/// Top-level SPL Memo instruction WITHOUT accounts (Memo v3 only verifies
+/// the signers it is given) — the atomic buyback already carries CC's and
+/// the hot key's signatures on the program instruction itself.
+fn memo_ix(text: &str) -> Instruction {
+    Instruction {
+        program_id: MEMO_PROGRAM_ID,
+        accounts: vec![],
+        data: text.as_bytes().to_vec(),
+    }
+}
+
 /// Delivers a CC-shaped prize into the vault the way the gacha actually does:
 /// the card is PRE-MINTED into CC's prize wallet (pNFT, CC rule set, creators,
 /// royalties), then the `:send` leg moves it — a CC-co-signed memo plus an
@@ -209,6 +224,14 @@ fn cc_memo_ix(w: &World, text: &str) -> Instruction {
 /// the vault PDA, which never signs). This also pins the design premise that
 /// an off-curve PDA can RECEIVE prizes.
 fn mint_prize_to_vault(w: &mut World) -> Prize {
+    mint_prize_to_vault_with_rule_set(w, Some(CC_RULE_SET))
+}
+
+/// Same delivery flow, but the rule set is parameterized: `None` mints a
+/// ProgrammableNonFungible WITHOUT a rule set (still frozen, still pNFT
+/// transfer rules) — a shape CC could ship and the withdraw path must handle
+/// with both optional auth-rules slots absent.
+fn mint_prize_to_vault_with_rule_set(w: &mut World, rule_set: Option<Pubkey>) -> Prize {
     let mint_kp = Keypair::new();
     let mint = mint_kp.pubkey();
     let metadata = Metadata::find_pda(&mint).0;
@@ -217,9 +240,12 @@ fn mint_prize_to_vault(w: &mut World) -> Prize {
     let cc_token_record = TokenRecord::find_pda(&mint, &cc_token).0;
     let token = ata(&w.vault, &mint);
     let token_record = TokenRecord::find_pda(&mint, &token).0;
+    // The auth-rules program only rides along when a rule set is attached.
+    let auth_rules_program = rule_set.map(|_| AUTH_RULES_PROGRAM_ID);
 
     // 1) CC pre-mints the card into its own prize wallet.
-    let create_ix = CreateV1Builder::new()
+    let mut create_builder = CreateV1Builder::new();
+    create_builder
         .metadata(metadata)
         .master_edition(Some(edition))
         .mint(mint, true)
@@ -240,10 +266,12 @@ fn mint_prize_to_vault(w: &mut World) -> Prize {
             key: Pubkey::new_unique(),
         })
         .token_standard(TokenStandard::ProgrammableNonFungible)
-        .rule_set(CC_RULE_SET)
         .print_supply(PrintSupply::Zero)
-        .spl_token_program(Some(TOKEN_PROGRAM_ID))
-        .instruction();
+        .spl_token_program(Some(TOKEN_PROGRAM_ID));
+    if let Some(rs) = rule_set {
+        create_builder.rule_set(rs);
+    }
+    let create_ix = create_builder.instruction();
 
     let mint_ix = MintV1Builder::new()
         .token(cc_token)
@@ -254,8 +282,8 @@ fn mint_prize_to_vault(w: &mut World) -> Prize {
         .mint(mint)
         .authority(w.cc_operator.pubkey())
         .payer(w.cc_operator.pubkey())
-        .authorization_rules_program(Some(AUTH_RULES_PROGRAM_ID))
-        .authorization_rules(Some(CC_RULE_SET))
+        .authorization_rules_program(auth_rules_program)
+        .authorization_rules(rule_set)
         .amount(1)
         .instruction();
 
@@ -280,8 +308,8 @@ fn mint_prize_to_vault(w: &mut World) -> Prize {
         .destination_token_record(Some(token_record))
         .authority(w.cc_operator.pubkey())
         .payer(w.cc_operator.pubkey())
-        .authorization_rules_program(Some(AUTH_RULES_PROGRAM_ID))
-        .authorization_rules(Some(CC_RULE_SET))
+        .authorization_rules_program(auth_rules_program)
+        .authorization_rules(rule_set)
         .amount(1)
         .instruction();
     // The :send TransferV1 lazily creates the vault's destination ATA +
@@ -493,6 +521,35 @@ fn approve_buyback_rejects_non_delegate_signer() {
     );
     // Anchor's has_one = hot_delegate constraint must reject the impostor.
     assert_fails_with(&mut w, tx, "ConstraintHasOne", "attacker approve_buyback");
+}
+
+/// The handler-side pin (`require_auth_rules_program`, stable code 6018 in
+/// every context): a PRESENT authorization_rules_program slot carrying any
+/// program other than mpl-token-auth-rules must be refused before the CPI —
+/// this program never forwards a foreign program id.
+#[test]
+fn approve_buyback_rejects_foreign_auth_rules_program() {
+    let mut w = setup(true);
+    let p = mint_prize_to_vault(&mut w);
+
+    let mut ix = approve_buyback_ix(&w, &p);
+    // Swap the auth-rules program for a random one (slot 9). Any key that is
+    // neither auth9Sig... nor this program's id (which would decode as None).
+    ix.accounts[9].pubkey = Pubkey::new_unique();
+    let tx = Transaction::new_signed_with_payer(
+        &[ix],
+        Some(&w.hot.pubkey()),
+        &[&w.hot],
+        w.svm.latest_blockhash(),
+    );
+    assert_fails_with(&mut w, tx, "Unauthorized", "foreign auth-rules program");
+
+    // No delegate was granted and the slot stayed free.
+    let record = token_record_of(&w, &p).expect("token record exists");
+    assert_eq!(record.delegate, None, "no Metaplex delegate granted");
+    let vault = get_vault(&w);
+    assert_eq!(vault.live_buyback_mint, None);
+    assert_eq!(vault.live_buyback_token, None);
 }
 
 // ---------------------------------------------------------------------------
@@ -896,6 +953,72 @@ fn withdraw_pnft_cold_only_and_within_packet_budget() {
     // TransferV1 closes the source TokenRecord (rent back to the payer =
     // the phone), so nothing vault-side lingers after the withdrawal.
     assert!(token_record_of(&w, &p).is_none());
+}
+
+/// Absent-encoding contract for the optional auth-rules slots: a pNFT WITHOUT
+/// a rule set is withdrawn with BOTH optional slots encoded as this program's
+/// own id (Anchor's `None` wire form) — the slots stay in place, never get
+/// dropped, and `require_auth_rules_program` takes its `None` branch.
+#[test]
+fn withdraw_pnft_without_rule_set_absent_optional_slots() {
+    let mut w = setup(true);
+    let p = mint_prize_to_vault_with_rule_set(&mut w, None);
+
+    let destination_owner = w.cold.pubkey();
+    let destination_token = ata(&destination_owner, &p.mint);
+    let destination_token_record = TokenRecord::find_pda(&p.mint, &destination_token).0;
+
+    let ix = Instruction {
+        program_id: PROGRAM_ID,
+        accounts: accounts::WithdrawPnft {
+            vault: w.vault,
+            cold_owner: w.cold.pubkey(),
+            payer: w.payer.pubkey(),
+            nft_mint: p.mint,
+            nft_token: p.token,
+            destination_owner,
+            destination_token,
+            metadata: p.metadata,
+            edition: p.edition,
+            token_record: p.token_record,
+            destination_token_record,
+            authorization_rules: None,
+            authorization_rules_program: None,
+            token_metadata_program: mpl_token_metadata::ID,
+            sysvar_instructions: sysvar::instructions::ID,
+            ata_program: ATA_PROGRAM_ID,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: instruction::WithdrawPnft {}.data(),
+    };
+    // The account list keeps its full 18-slot shape: absent optionals are
+    // FILLED with the program's own id, not dropped (they are not trailing).
+    assert_eq!(ix.accounts.len(), 18, "all 18 slots present");
+    assert_eq!(
+        ix.accounts[11].pubkey, PROGRAM_ID,
+        "absent authorization_rules encoded as the program id"
+    );
+    assert_eq!(
+        ix.accounts[12].pubkey, PROGRAM_ID,
+        "absent authorization_rules_program encoded as the program id"
+    );
+
+    let tx = Transaction::new_signed_with_payer(
+        &[
+            ComputeBudgetInstruction::set_compute_unit_limit(300_000),
+            ix,
+        ],
+        Some(&w.payer.pubkey()),
+        &[&w.payer, &w.cold],
+        w.svm.latest_blockhash(),
+    );
+    w.svm
+        .send_transaction(tx)
+        .expect("withdraw_pnft of a rule-set-less pNFT with absent optional slots");
+    assert_eq!(spl_amount(&w, &destination_token), 1, "prize reached the destination");
+    assert_eq!(spl_amount(&w, &p.token), 0);
 }
 
 // ---------------------------------------------------------------------------
@@ -1425,18 +1548,48 @@ fn buyback_pnft_ix(
         .to_account_metas(None),
         data: instruction::BuybackPnft {
             price,
-            memo: "tangem-11111111-2222:buyback".to_string(),
+            memo: CC_BUYBACK_MEMO.to_string(),
         }
         .data(),
     }
 }
 
+/// Production shape of CC's buyback transaction per the builder contract:
+/// idempotent vault-USDC ATA creation (paid by CC; a no-op when the ATA
+/// exists) + compute budget + top-level memo + the buyback instruction,
+/// fee payer CC, signed by CC and the hot key. The ATA leg derives the
+/// CANONICAL vault-USDC ATA itself (vault at index 1, usdc_mint at index 5)
+/// exactly like CC's builder would — deliberately NOT read from the buyback
+/// instruction's vault_usdc slot, so a test that plants a decoy there still
+/// exercises the program's own ATA pin rather than the ATA program's.
 fn signed_buyback_tx(w: &World, ix: Instruction) -> Transaction {
     let cc = w.cc_operator.insecure_clone();
     let hot = w.hot.insecure_clone();
+    let (canonical_vault_usdc, _) = Pubkey::find_program_address(
+        &[
+            ix.accounts[1].pubkey.as_ref(),
+            TOKEN_PROGRAM_ID.as_ref(),
+            ix.accounts[5].pubkey.as_ref(),
+        ],
+        &ATA_PROGRAM_ID,
+    );
+    let create_vault_usdc = Instruction {
+        program_id: ATA_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(cc.pubkey(), true),
+            AccountMeta::new(canonical_vault_usdc, false),
+            AccountMeta::new_readonly(ix.accounts[1].pubkey, false),
+            AccountMeta::new_readonly(ix.accounts[5].pubkey, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![1], // CreateIdempotent
+    };
     Transaction::new_signed_with_payer(
         &[
+            create_vault_usdc,
             ComputeBudgetInstruction::set_compute_unit_limit(400_000),
+            memo_ix(CC_BUYBACK_MEMO),
             ix,
         ],
         Some(&cc.pubkey()),
@@ -1468,7 +1621,44 @@ fn buyback_pnft_atomic_swap_and_gc() {
     let prize_wallet = Pubkey::new_unique();
     let ix = buyback_pnft_ix(&w, &p, prize_wallet, usdc_mint, cc_usdc, price);
     let tx = signed_buyback_tx(&w, ix);
-    w.svm.send_transaction(tx).expect("buyback_pnft");
+
+    // ---- Buyback transaction size measurement (CC builds this tx) ----
+    // Full production shape per the builder contract: idempotent vault-USDC
+    // ATA creation + compute-budget 400k + top-level memo of realistic
+    // dev-slug length + the 22-account buyback_pnft instruction, two
+    // signatures (CC + hot).
+    let message_size = tx.message_data().len();
+    // Legacy tx wire size = shortvec(sig count = 2) + 2 * 64 + message.
+    let tx_size = 1 + 2 * 64 + message_size;
+    println!("buyback_pnft (create-idempotent + compute-budget + top-level memo + 22 accounts):");
+    println!("  message: {message_size} bytes");
+    println!("  serialized transaction: {tx_size} bytes (Solana cap {PACKET_DATA_SIZE})");
+    assert!(
+        tx_size <= PACKET_DATA_SIZE,
+        "buyback_pnft must fit a single Solana packet ({tx_size} > {PACKET_DATA_SIZE})"
+    );
+
+    let meta = w.svm.send_transaction(tx).expect("buyback_pnft");
+
+    // Both things CC's matcher greps the logs for must actually be there:
+    // the Memo program echoing the memo text, and the BuybackExecuted event.
+    let logs = &meta.logs;
+    assert!(
+        logs.iter().any(|l| l.contains(&format!("Program {MEMO_PROGRAM_ID} invoke [1]"))),
+        "top-level Memo instruction executed, got:\n{}",
+        logs.join("\n")
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("Memo") && l.contains(CC_BUYBACK_MEMO)),
+        "Memo program logs the memo text, got:\n{}",
+        logs.join("\n")
+    );
+    let ev: common::BuybackExecuted =
+        common::decode_event(logs).expect("BuybackExecuted was emitted and decodes");
+    assert_eq!(ev.vault, w.vault);
+    assert_eq!(ev.mint, p.mint);
+    assert_eq!(ev.price, price);
+    assert_eq!(ev.memo, CC_BUYBACK_MEMO);
 
     assert_eq!(
         lamports_of(&w, &w.vault),
@@ -1647,7 +1837,7 @@ fn buyback_pnft_rejects_non_canonical_vault_usdc() {
     let decoy = create_decoy_vault_token_account(&mut w, &usdc_mint);
 
     let mut ix = buyback_pnft_ix(&w, &p, w.cc_operator.pubkey(), usdc_mint, cc_usdc, 100_000_000);
-    ix.accounts[7].pubkey = decoy; // vault_usdc slot (after destination_owner)
+    ix.accounts[7].pubkey = decoy; // vault_usdc slot (after cc_usdc)
 
     let tx = signed_buyback_tx(&w, ix);
     assert_fails_with(

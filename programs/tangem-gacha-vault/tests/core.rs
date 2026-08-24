@@ -29,6 +29,12 @@ const CC_CORE_COLLECTION: Pubkey = pubkey!("CCryptUfeFSZ3Fgc9FLeKrhLVAP67FSqi1Gu
 const CC_CORE_ASSET: Pubkey = pubkey!("13fCVtpxtzN8mv8jERe6Ev7rSuXM4nbSwFGhmauvKB7b");
 const TOKEN_PROGRAM_ID: Pubkey = pubkey!("TokenkegQfeZyiNwAJbNbGKPFXCWuBvf9Ss623VQ5DA");
 const ATA_PROGRAM_ID: Pubkey = pubkey!("ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL");
+const MEMO_PROGRAM_ID: Pubkey = pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
+/// The reconciliation key CC's matcher greps for — carried BOTH as the
+/// buyback instruction argument (recorded in BuybackExecuted) and as a
+/// top-level SPL Memo instruction in the same transaction. Realistic length:
+/// the dev slug format is `dev-<uuid>:buyback` (48 bytes).
+const CC_BUYBACK_MEMO: &str = "dev-00000000-1111-2222-3333-444444444444:buyback";
 
 fn fixture(name: &str) -> String {
     format!(
@@ -344,6 +350,68 @@ fn install_usdc_world(w: &mut World, cc: &Keypair) -> (Pubkey, Pubkey, Pubkey, P
     (config_pda, usdc_mint, vault_usdc, cc_usdc)
 }
 
+/// Top-level SPL Memo instruction (no accounts — Memo v3 only verifies the
+/// signers it is given), the exact leg CC's buyback template carries.
+fn memo_ix(text: &str) -> Instruction {
+    Instruction {
+        program_id: MEMO_PROGRAM_ID,
+        accounts: vec![],
+        data: text.as_bytes().to_vec(),
+    }
+}
+
+/// Idempotent creation of the vault's canonical USDC ATA — the instruction
+/// CC's builder prepends to every buyback (the program pins the ATA but does
+/// not create it). Data [1] = CreateIdempotent.
+fn create_idempotent_ix(payer: &Pubkey, ata: &Pubkey, owner: &Pubkey, mint: &Pubkey) -> Instruction {
+    Instruction {
+        program_id: ATA_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(*payer, true),
+            AccountMeta::new(*ata, false),
+            AccountMeta::new_readonly(*owner, false),
+            AccountMeta::new_readonly(*mint, false),
+            AccountMeta::new_readonly(system_program::ID, false),
+            AccountMeta::new_readonly(TOKEN_PROGRAM_ID, false),
+        ],
+        data: vec![1],
+    }
+}
+
+/// A plain (non-ATA) SPL token account with owner = the vault and mint =
+/// `mint` — the "decoy" anyone can create without the vault signing.
+fn create_decoy_vault_token_account(w: &mut World, mint: &Pubkey) -> Pubkey {
+    let kp = Keypair::new();
+    let len = 165;
+    let rent = w.svm.minimum_balance_for_rent_exemption(len);
+    let create = system_instruction::create_account(
+        &w.payer.pubkey(),
+        &kp.pubkey(),
+        rent,
+        len as u64,
+        &TOKEN_PROGRAM_ID,
+    );
+    // spl-token InitializeAccount3: tag 18 + owner pubkey.
+    let mut data = vec![18u8];
+    data.extend_from_slice(w.vault.as_ref());
+    let init = Instruction {
+        program_id: TOKEN_PROGRAM_ID,
+        accounts: vec![
+            AccountMeta::new(kp.pubkey(), false),
+            AccountMeta::new_readonly(*mint, false),
+        ],
+        data,
+    };
+    let tx = Transaction::new_signed_with_payer(
+        &[create, init],
+        Some(&w.payer.pubkey()),
+        &[&w.payer, &kp],
+        w.svm.latest_blockhash(),
+    );
+    w.svm.send_transaction(tx).expect("create decoy token account");
+    kp.pubkey()
+}
+
 fn buyback_core_ix(
     w: &World,
     config: Pubkey,
@@ -372,7 +440,7 @@ fn buyback_core_ix(
         .to_account_metas(None),
         data: instruction::BuybackCore {
             price,
-            memo: "tangem-11111111-2222:buyback".to_string(),
+            memo: CC_BUYBACK_MEMO.to_string(),
         }
         .data(),
     }
@@ -394,19 +462,80 @@ fn buyback_core_atomic_swap() {
     let prize_wallet = Pubkey::new_unique();
     let ix = buyback_core_ix(&w, config, &cc, prize_wallet, usdc_mint, cc_usdc, price);
     let hot = w.hot.insecure_clone();
+    // Production shape per the builder contract: CC prepends the idempotent
+    // vault-USDC ATA creation (a no-op when the ATA exists) and a top-level
+    // memo — CC's matcher parses the transaction by that memo and the event.
+    let create_vault_usdc = create_idempotent_ix(&cc.pubkey(), &vault_usdc, &w.vault, &usdc_mint);
     let tx = Transaction::new_signed_with_payer(
-        &[ix],
+        &[create_vault_usdc, memo_ix(CC_BUYBACK_MEMO), ix],
         Some(&cc.pubkey()),
         &[&cc, &hot],
         w.svm.latest_blockhash(),
     );
-    w.svm
+    let meta = w
+        .svm
         .send_transaction(tx)
         .expect("buyback_core against the real mpl-core + CC collection plugins");
 
     assert_eq!(asset_owner(&w.svm), prize_wallet, "Core asset went to CC's prize wallet, not the signer");
     assert_eq!(spl_amount(&w.svm, &vault_usdc), price, "refund landed in the vault");
     assert_eq!(spl_amount(&w.svm, &cc_usdc), 1_000_000_000 - price);
+
+    // Both things CC's matcher greps the logs for must actually be there:
+    // the Memo program echoing the memo text, and the BuybackExecuted event.
+    let logs = &meta.logs;
+    assert!(
+        logs.iter().any(|l| l.contains(&format!("Program {MEMO_PROGRAM_ID} invoke [1]"))),
+        "top-level Memo instruction executed, got:\n{}",
+        logs.join("\n")
+    );
+    assert!(
+        logs.iter().any(|l| l.contains("Memo") && l.contains(CC_BUYBACK_MEMO)),
+        "Memo program logs the memo text, got:\n{}",
+        logs.join("\n")
+    );
+    let ev: common::BuybackExecuted =
+        common::decode_event(logs).expect("BuybackExecuted was emitted and decodes");
+    assert_eq!(ev.vault, w.vault);
+    assert_eq!(ev.mint, CC_CORE_ASSET, "Core buybacks report the ASSET address as the mint");
+    assert_eq!(ev.price, price);
+    assert_eq!(ev.memo, CC_BUYBACK_MEMO);
+}
+
+/// The refund cannot be steered away from the vault's canonical USDC ATA:
+/// a plain vault-owned USDC account in the vault_usdc slot is refused
+/// (mirror of the pnft-side test — the Core context pins the same ATA).
+#[test]
+fn buyback_core_rejects_non_canonical_vault_usdc() {
+    let mut w = setup();
+    let cc = Keypair::new();
+    w.svm.airdrop(&cc.pubkey(), 10_000_000_000).unwrap();
+    let (config, usdc_mint, vault_usdc, cc_usdc) = install_usdc_world(&mut w, &cc);
+    let decoy = create_decoy_vault_token_account(&mut w, &usdc_mint);
+
+    let mut ix = buyback_core_ix(&w, config, &cc, cc.pubkey(), usdc_mint, cc_usdc, 100_000_000);
+    ix.accounts[7].pubkey = decoy; // vault_usdc slot (after cc_usdc)
+    let hot = w.hot.insecure_clone();
+    let tx = Transaction::new_signed_with_payer(
+        &[memo_ix(CC_BUYBACK_MEMO), ix],
+        Some(&cc.pubkey()),
+        &[&cc, &hot],
+        w.svm.latest_blockhash(),
+    );
+    match w.svm.send_transaction(tx) {
+        Ok(_) => panic!("non-canonical vault_usdc must be refused"),
+        Err(f) => {
+            let logs = f.meta.logs.join("\n");
+            assert!(
+                logs.contains("ConstraintAssociated"),
+                "expected the ATA pin to reject the decoy, got:\n{logs}"
+            );
+        }
+    }
+    assert_eq!(asset_owner(&w.svm), w.vault, "asset stays in the vault");
+    assert_eq!(spl_amount(&w.svm, &decoy), 0, "no refund reached the decoy");
+    assert_eq!(spl_amount(&w.svm, &vault_usdc), 0, "no refund at all");
+    assert_eq!(spl_amount(&w.svm, &cc_usdc), 1_000_000_000, "CC was not debited");
 }
 
 /// Only the config-pinned CC wallet can execute a Core buyback.

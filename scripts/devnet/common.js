@@ -11,8 +11,13 @@ const API = "https://dev-gacha.collectorcrypt.com/api";
 // CC DEV-environment API key (sets our memo slug); scoped to the dev gacha
 // only, no funds behind it. Override for other environments — never hardcode
 // a prod key here.
+// Checked lazily in post()/get(): only the CC API calls need the key — the
+// on-chain-only scripts (vault_buyback_atomic.js) must run without it.
 const KEY = process.env.CC_API_KEY;
-if (!KEY) throw new Error("set CC_API_KEY (dev API key from CC)");
+const requireKey = () => {
+  if (!KEY) throw new Error("set CC_API_KEY (dev API key from CC)");
+  return KEY;
+};
 const RPC = "https://api.devnet.solana.com";
 
 const USDC = new PublicKey("Gh9ZwEmdLJ8DscKNTkTqPbNwLNNBjuSzaG9Vp2KGtKJr"); // CC dev-USDC (NOT Circle 4zMMC9…)
@@ -47,10 +52,10 @@ function load() {
 
 const post = (ep, body) => fetch(`${API}/${ep}`, {
   method: "POST",
-  headers: { "Content-Type": "application/json", "x-api-key": KEY },
+  headers: { "Content-Type": "application/json", "x-api-key": requireKey() },
   body: JSON.stringify(body),
 }).then(async (r) => ({ status: r.status, json: await r.json().catch(() => ({})) }));
-const get = (ep) => fetch(`${API}/${ep}`, { headers: { "x-api-key": KEY } }).then((r) => r.json());
+const get = (ep) => fetch(`${API}/${ep}`, { headers: { "x-api-key": requireKey() } }).then((r) => r.json());
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 module.exports = {
