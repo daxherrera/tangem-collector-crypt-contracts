@@ -1,0 +1,2720 @@
+{
+  "address": "29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u",
+  "metadata": {
+    "name": "tangem_gacha_vault",
+    "version": "0.1.0",
+    "spec": "0.1.0",
+    "description": "Tangem Collectibles: delegated-access vault for Collector Crypt Gacha (open pack / buyback without cold-key taps)"
+  },
+  "docs": [
+    "Per-user delegated-custody vault for the Collector Crypt Gacha integration.",
+    "",
+    "Integration facts this design is built on:",
+    "- CC's gacha has NO on-chain program. `generatePack` returns a backend-built",
+    "tx (the gacha wallet pre-signs as FEE PAYER;",
+    "the memo instruction itself carries no accounts): top-level memo",
+    "`<slug>-<uuid>:open` + top-level USDC transfer from the player's ATA to",
+    "their treasury. The API's `memo` field is the bare `<slug>-<uuid>` join",
+    "key; the `:open` suffix is appended when the tx is built. We DISCARD this",
+    "tx and pay from the vault instead (see the spin path below).",
+    "- Prizes are MOSTLY Metaplex Core assets now (AssetV1, collection",
+    "CCryptUfeFSZ3Fgc9FLeKrhLVAP67FSqi1GuVoj9CRac — see withdraw_core); older",
+    "prizes are Token Metadata pNFTs (TokenStandard=4, collection",
+    "CCryptWBYktukHDQ2vHGtVcmtjXxYzvw8XNVY64YN2Yf). pNFT token accounts are",
+    "permanently frozen: plain spl-token transfer/approve are impossible; all",
+    "moves go through Token Metadata `TransferV1`, delegation through",
+    "`DelegateV1` (TokenDelegateRole::Transfer, stored in the TokenRecord and",
+    "cleared automatically on transfer).",
+    "- A PDA CAN receive prize NFTs (recipient never signs the `:send` leg,",
+    "`altPlayerAddress` is an explicit API param), and buyback eligibility is",
+    "any current holder within ~3 days of the prize leaving the gacha.",
+    "`/api/buyback` takes an optional `transferAuthority` and builds for",
+    "off-curve owners, and CC scopes a no-closeAccount template to our API",
+    "key — so the legacy path (`approve_buyback` + CC's template) works today.",
+    "It exists ONLY until CC's backend switches to `buyback_pnft` /",
+    "`buyback_core` below; once it does, `approve_buyback` becomes removable",
+    "and `allow_buyback_delegation` should be set false permanently, which",
+    "retires the standing-delegate drain risk entirely.",
+    "",
+    "The spin path: `open_pack` pays the CC treasury from the vault via an",
+    "inner CPI transfer; the client adds a top-level `<memo>:open` memo",
+    "instruction, and CC's webhook credits the spin by matching memo + treasury",
+    "transfer (inner instructions included; no gacha-wallet co-signature, no",
+    "payer registration needed).",
+    "",
+    "Trust model (honest worst case):",
+    "- `cold_owner` (Tangem card key) is the root authority: rotate the hot",
+    "delegate, change caps, withdraw any asset anywhere, close the vault.",
+    "- `hot_delegate` (phone key) can:",
+    "(a) pay for spins within the per-spin/daily caps, and ONLY to the",
+    "whitelisted treasury accounts fixed in the config. Note what the caps",
+    "do NOT bound: the prize RECIPIENT is `altPlayerAddress`, chosen",
+    "off-chain when the memo is minted, and CC credits whichever memo",
+    "accompanies a treasury transfer regardless of who paid. A compromised",
+    "hot key can therefore spend the vault's USDC on spins whose prizes are",
+    "delivered to ITS OWN wallet, realizing the caps as value, not as",
+    "waste. Size `daily_cap` as a theft budget. The only binding is",
+    "operational: the Tangem backend must mint memos exclusively with",
+    "`altPlayerAddress` = the vault PDA, index every `PackOpened.memo`, and",
+    "alarm on a memo it did not issue or a prize not delivered to the PDA.",
+    "(b) take a transfer delegate over vault-held prize pNFTs one at a time.",
+    "A transfer delegate can move that pNFT ANYWHERE (the CC ruleset blocks",
+    "nothing), so a compromised hot key can drain vault pNFTs one-by-one by",
+    "cycling approve → transfer → clear. The one-live-delegate slot and the",
+    "`allow_buyback_delegation` kill switch bound the rate of THIS path",
+    "only; `revoke_buyback` and `update_vault` (rotate key) are the",
+    "reactive controls.",
+    "(c) co-sign `buyback_pnft` / `buyback_core` (see below).",
+    "- Tangem admin key: config only, but `config.gacha_wallet` is NOT merely a",
+    "payment address — it is an ASSET-CUSTODY authority. It is the `address =`",
+    "pin on `cc_authority`, i.e. it names the only key that may execute a",
+    "buyback — one that sends the prize to an UNCONSTRAINED `destination_owner`",
+    "of that signer's choosing, for pNFTs and for Core alike. So admin + hot",
+    "together can move ANY prize out of ANY vault, to any address, at any",
+    "`price > 0`, with no cold-key tap: `price` has no on-chain floor, the caps",
+    "do not apply, and the one-live-delegate slot does not either. In",
+    "particular Core prizes are no longer cold-only — before these",
+    "instructions, `withdraw_core` was their sole exit. Hold the admin key in a",
+    "multisig (Squads) — that is a prerequisite, not a nicety — and alarm on",
+    "`ConfigUpdated`, treating a change to ANY of `gacha_wallet`,",
+    "`gacha_usdc_account` or `fee_usdc_account` as break-glass. Incident levers,",
+    "in order of bluntness: repoint `gacha_wallet` (disables both buybacks",
+    "globally and moves the sweep rent away, while spins keep working, since",
+    "`open_pack` pins the separate `gacha_usdc_account`); `paused` (stops spins",
+    "and buybacks for everyone); per vault, a cold-key `update_vault` hot",
+    "rotation. `allow_buyback_delegation` gates `approve_buyback` ONLY and is",
+    "not a brake on the atomic buybacks.",
+    "The admin key also reaches value on a SECOND, independent path: the same",
+    "one-signature `update_config` rewrites `gacha_usdc_account` and",
+    "`fee_usdc_account`, and those two pins are the only destination checks",
+    "`open_pack` performs. One admin write therefore diverts 100% of every",
+    "FUTURE spin payment — principal and fee, every vault, Config being a",
+    "singleton — to an attacker-owned USDC account, with no hot key involved:",
+    "users keep spinning, CC never credits the spins, the money lands",
+    "elsewhere. `MAX_FEE_BPS` bounds the fee rate, not this.",
+    "- Collector Crypt: for Core prizes CC holds collection-level",
+    "PermanentTransferDelegate/PermanentBurnDelegate, so it can seize or burn",
+    "them regardless of custody. The vault protects Core prizes against key",
+    "theft, not against CC."
+  ],
+  "instructions": [
+    {
+      "name": "approve_buyback",
+      "docs": [
+        "Hot-delegate action: take a Metaplex Token Metadata TRANSFER delegate",
+        "(TokenDelegateRole::Transfer, amount = 1) over ONE vault-held prize",
+        "pNFT, so the hot key can countersign Collector Crypt's buyback",
+        "transaction as the transfer authority (requires CC to build the buyback",
+        "tx with authority = delegate, fee payer = the hot key, and without the",
+        "closeAccount instruction; `altRecipient` points the USDC refund at the",
+        "vault).",
+        "",
+        "HONEST TRADE-OFF: a transfer delegate can move the pNFT to ANY address",
+        "(the CC ruleset blocks nothing), entirely outside this program. Only",
+        "one delegate may be live per vault at a time (`live_buyback_mint`), so",
+        "a compromised hot key drains prizes serially, not in one shot — the",
+        "slot frees only when the previous NFT provably left or was revoked",
+        "(`clear_buyback_slot` / `revoke_buyback`). The admin kill switch is",
+        "`allow_buyback_delegation`; the cold-side controls are `revoke_buyback`",
+        "and rotating the hot key."
+      ],
+      "discriminator": [
+        79,
+        220,
+        204,
+        199,
+        181,
+        27,
+        86,
+        204
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "docs": [
+            "Also pays for the token-record write."
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "nft_mint"
+        },
+        {
+          "name": "nft_token",
+          "writable": true
+        },
+        {
+          "name": "metadata",
+          "writable": true
+        },
+        {
+          "name": "edition"
+        },
+        {
+          "name": "token_record",
+          "writable": true
+        },
+        {
+          "name": "authorization_rules",
+          "docs": [
+            "(CC cards use the Metaplex Foundation Rule Set) — validated by the CPI."
+          ],
+          "optional": true
+        },
+        {
+          "name": "authorization_rules_program",
+          "docs": [
+            "uniformity with BuybackPnft — the one context whose generated",
+            "`try_accounts` frame cannot take an `address =` constraint. ABSENT is",
+            "encoded by passing THIS PROGRAM's id in this slot (anchor-ts does that",
+            "for null); the slot is not last, so it must be filled, never dropped."
+          ],
+          "optional": true
+        },
+        {
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        },
+        {
+          "name": "sysvar_instructions",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "buyback_core",
+      "docs": [
+        "Atomic buyback of a Metaplex CORE prize — same contract as",
+        "`buyback_pnft` (CC operator wallet + hot key sign; USDC refund into",
+        "the vault, then the asset moves), but a single light mpl-core transfer:",
+        "the vault PDA signs as the asset owner, Core assets ship unfrozen, and",
+        "there are no token accounts to garbage-collect. The asset lands at",
+        "`destination_owner` — CC's free per-transaction choice (their prizes",
+        "live across many rotating prize wallets, not on the operator wallet).",
+        "",
+        "The same CLIENT CONTRACT as `buyback_pnft` applies — create the vault's",
+        "USDC ATA idempotently first, decode and display the `price` argument,",
+        "and refuse a transaction carrying any other instruction of this program.",
+        "The compute cost is a fraction of the pNFT path (one CPI, no ATA or",
+        "TokenRecord creation), so the default budget suffices.",
+        "",
+        "SCOPE, HONESTLY: `asset` is pinned to be an mpl-core account and nothing",
+        "more — mpl-core binds the collection to the asset, but neither is pinned",
+        "to CC's collection, so this moves ANY Core asset the vault holds."
+      ],
+      "discriminator": [
+        1,
+        108,
+        17,
+        204,
+        52,
+        40,
+        164,
+        144
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "docs": [
+            "User consent to the offered price."
+          ],
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "cc_authority",
+          "docs": [
+            "The CC operator wallet fixed in the config: pays the refund and the",
+            "fees. The asset itself goes to `destination_owner`."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "destination_owner",
+          "docs": [
+            "choice (prizes return to rotating prize wallets, not to the operator",
+            "wallet). Deliberately unconstrained: `cc_authority` signs and pays, so",
+            "where CC sends the prize it just bought is CC's own business; the",
+            "user's protection is the price, which the hot key co-signs."
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "cc_usdc",
+          "docs": [
+            "CC's USDC account the refund is paid from (its authority is",
+            "`cc_authority` — enforced by the token program on the transfer)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "docs": [
+            "The vault's CANONICAL USDC ATA — the only place the refund can land."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "usdc_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "asset",
+          "docs": [
+            "validated by the mpl-core CPI (it refuses to transfer an asset the vault",
+            "does not own)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "collection",
+          "docs": [
+            "mpl-core binds it to the asset's own UpdateAuthority::Collection and",
+            "rejects both a substituted collection and an omitted one, so an Anchor",
+            "constraint would add nothing while breaking collection-less assets",
+            "(signalled by passing the mpl-core program id in this slot)."
+          ]
+        },
+        {
+          "name": "mpl_core_program",
+          "address": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "buyback_pnft",
+      "docs": [
+        "Atomic buyback of a prize pNFT, executed by Collector Crypt against",
+        "the vault: CC pays `price` USDC into the vault's canonical USDC ATA",
+        "and receives the NFT in the same instruction — the vault PDA signs the",
+        "Token Metadata TransferV1 as the OWNER, so no standing delegate is",
+        "involved. Two signatures: the CC operator wallet fixed in the config",
+        "(pays the refund, the fees and the rent) and the hot key (user consent",
+        "to the offered price). The NFT lands at `destination_owner` — CC's free",
+        "per-transaction choice, since their prizes live across rotating prize",
+        "wallets rather than on the operator wallet. The emptied prize ATA is",
+        "then closed with its lamports returned to CC, who fronted that rent at",
+        "delivery (the whole balance, not just the rent — see the close site), and a",
+        "stale `approve_buyback` slot pointing at this token is freed.",
+        "",
+        "`memo` is CC's reconciliation key, recorded in the BuybackExecuted",
+        "event (CC's webhook additionally reads its own top-level memo",
+        "instruction, which their backend adds when building the transaction).",
+        "",
+        "CLIENT CONTRACT — the transaction is built by CC, so the phone's single",
+        "signature is the only thing standing behind every instruction in it:",
+        "- Prepend `AssociatedTokenAccount::CreateIdempotent(vault_usdc)` (payer",
+        "= `cc_authority`). `buyback_pnft` PINS the vault's canonical USDC ATA",
+        "but does NOT create it, so against a vault that never held USDC — or",
+        "whose ATA the cold owner closed at offboarding — `buyback_pnft` itself",
+        "aborts with `AccountNotInitialized` (3012).",
+        "- Set a compute-unit limit of ~400k: the TransferV1 creates the",
+        "destination ATA + TokenRecord and evaluates the rule set, which does",
+        "not fit the 200k default.",
+        "- The phone MUST decode the transaction before signing: display the",
+        "`price` ARGUMENT (not the quote the API rendered — nothing on-chain",
+        "bounds `price` beyond `> 0`), and refuse any transaction carrying an",
+        "instruction of this program other than the single buyback it is",
+        "showing. Consent is instruction-scoped, not transaction-scoped, and a",
+        "bundled `open_pack` would be signed by the very same hot key.",
+        "",
+        "SCOPE, HONESTLY: `nft_mint` carries no collection or creator pin — this",
+        "moves ANY vault-held NFT, not only CC-issued prizes. The client is what",
+        "keeps a non-CC asset the user parked in the vault out of scope."
+      ],
+      "discriminator": [
+        229,
+        155,
+        236,
+        186,
+        92,
+        43,
+        99,
+        54
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "docs": [
+            "User consent to the offered price."
+          ],
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "cc_authority",
+          "docs": [
+            "The CC operator wallet fixed in the config: pays the refund, the fees",
+            "and the rent; receives the closed ATA's whole lamport balance. The NFT",
+            "itself goes to `destination_owner`."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "destination_owner",
+          "docs": [
+            "choice (prizes return to rotating prize wallets, not to the operator",
+            "wallet). Deliberately unconstrained: `cc_authority` signs and pays, so",
+            "where CC sends the prize it just bought is CC's own business; the",
+            "user's protection is the price, which the hot key co-signs."
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "cc_usdc",
+          "docs": [
+            "CC's USDC account the refund is paid from (its authority is",
+            "`cc_authority` — enforced by the token program on the transfer)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "vault_usdc",
+          "docs": [
+            "The vault's CANONICAL USDC ATA — the only place the refund can land."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "usdc_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "nft_mint"
+        },
+        {
+          "name": "nft_token",
+          "writable": true
+        },
+        {
+          "name": "destination_token",
+          "docs": [
+            "created by the Token Metadata CPI when missing, validated there."
+          ],
+          "writable": true
+        },
+        {
+          "name": "metadata",
+          "writable": true
+        },
+        {
+          "name": "edition"
+        },
+        {
+          "name": "token_record",
+          "writable": true
+        },
+        {
+          "name": "destination_token_record",
+          "writable": true
+        },
+        {
+          "name": "authorization_rules",
+          "optional": true
+        },
+        {
+          "name": "authorization_rules_program",
+          "docs": [
+            "the handler (not as an `address =` constraint) so a wrong auth-rules",
+            "program fails with the same 6018 across every context. History: before",
+            "the typed accounts were Boxed, this context's `try_accounts` frame sat",
+            "8 bytes under the 4 KB SBF stack limit and could not take one more",
+            "constraint; the toolchain only WARNS on overflow and still emits the",
+            ".so, which is why `check_fixtures.sh` greps the build log for \"Stack",
+            "offset\". ABSENT is encoded by passing THIS PROGRAM's id in this slot",
+            "(anchor-ts does that for null); the slot is not last, so it must be",
+            "filled, never dropped."
+          ],
+          "optional": true
+        },
+        {
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        },
+        {
+          "name": "sysvar_instructions",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "ata_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "price",
+          "type": "u64"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "clear_buyback_slot",
+      "docs": [
+        "Free the buyback slot after a COMPLETED buyback (the pNFT transfer",
+        "consumed the delegate, so there is nothing to revoke). Requires",
+        "on-chain proof against the EXACT account that was delegated",
+        "(`live_buyback_token`): it must be empty or delegate-free. Presenting a",
+        "different vault-owned account of the same mint cannot forge completion.",
+        "Callable by cold owner or hot delegate.",
+        "",
+        "NOT needed after `buyback_pnft`, which frees the slot itself. Calling it",
+        "then fails with Anchor `AccountNotInitialized` (3012) on `nft_token` —",
+        "that ATA was closed in the same instruction, and the typed account is",
+        "resolved before this handler runs, so `NoLiveBuyback` is never reached."
+      ],
+      "discriminator": [
+        255,
+        87,
+        21,
+        11,
+        164,
+        182,
+        47,
+        20
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "docs": [
+            "Cold owner OR hot delegate (checked in the handler)."
+          ],
+          "signer": true
+        },
+        {
+          "name": "nft_token",
+          "docs": [
+            "The exact token account recorded in `live_buyback_token`; the handler",
+            "checks token-account identity (`nft_token.key() == live_buyback_token`),",
+            "which subsumes the mint — a same-mint decoy account is rejected."
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "close_token_account",
+      "docs": [
+        "Cold-key-only: close an EMPTY vault-owned token account and return its",
+        "rent to the cold owner. This is the GC path for NFT ATAs left behind by",
+        "completed buybacks (CC's template normally closes them, but the",
+        "delegate-authority variant cannot) and for the USDC ATA at offboarding.",
+        "The TokenRecord needs no GC: Token Metadata TransferV1 closes the",
+        "source record itself, refunding its rent to that transfer's payer.",
+        "Closure is verified on both the delegate and the owner path in",
+        "tests/pnft.rs; the rent DESTINATION is asserted on the delegate path."
+      ],
+      "discriminator": [
+        132,
+        172,
+        24,
+        60,
+        100,
+        156,
+        135,
+        97
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "docs": [
+            "Receives the reclaimed rent."
+          ],
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "token",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "close_vault",
+      "docs": [
+        "Cold-key-only: close the vault state account, returning rent to the",
+        "cold owner. Withdraw assets and close token accounts (via",
+        "`close_token_account`) FIRST. Safety net: the PDA derives solely from",
+        "the cold key, so re-running `init_vault` with the same cold owner",
+        "recreates the same address and restores access to anything left behind",
+        "(e.g. a prize delivered after closing).",
+        "",
+        "Gated on a clean delegate state: a live buyback delegate must be",
+        "revoked first (via `revoke_buyback` / `clear_buyback_slot`). Otherwise",
+        "a close + re-init would reset the slot while the old hot key's",
+        "Metaplex delegate stayed live on-chain."
+      ],
+      "discriminator": [
+        141,
+        103,
+        17,
+        126,
+        72,
+        75,
+        29,
+        29
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "writable": true,
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "init_vault",
+      "docs": [
+        "Creates the per-user vault. The Tangem card taps ONCE here (cold_owner",
+        "signature); the phone wallet pays rent so the cold-signed message stays",
+        "minimal (Tangem cards have a stricter transaction-size budget than",
+        "Solana itself)."
+      ],
+      "discriminator": [
+        77,
+        79,
+        85,
+        150,
+        33,
+        217,
+        52,
+        106
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "docs": [
+            "The Tangem card key — must sign vault creation."
+          ],
+          "signer": true
+        },
+        {
+          "name": "payer",
+          "docs": [
+            "Rent payer (typically the phone's hot wallet) so the cold-signed",
+            "transaction stays small."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "hot_delegate",
+          "type": "pubkey"
+        },
+        {
+          "name": "per_spin_cap",
+          "type": "u64"
+        },
+        {
+          "name": "daily_cap",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "initialize_config",
+      "docs": [
+        "One-time global setup. Only the program's upgrade authority can call",
+        "this (prevents config-admin front-running between deploy and init)."
+      ],
+      "discriminator": [
+        208,
+        127,
+        21,
+        1,
+        194,
+        190,
+        196,
+        70
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "admin",
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "program",
+          "docs": [
+            "Gate initialization to the program's upgrade authority so the config",
+            "admin cannot be front-run between deploy and init."
+          ],
+          "address": "29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u"
+        },
+        {
+          "name": "program_data"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": [
+        {
+          "name": "gacha_wallet",
+          "type": "pubkey"
+        },
+        {
+          "name": "gacha_usdc_account",
+          "type": "pubkey"
+        },
+        {
+          "name": "fee_usdc_account",
+          "type": "pubkey"
+        },
+        {
+          "name": "fee_bps",
+          "type": "u16"
+        },
+        {
+          "name": "allow_buyback_delegation",
+          "type": "bool"
+        }
+      ]
+    },
+    {
+      "name": "open_pack",
+      "docs": [
+        "Pay for one gacha spin straight from the vault, signed only by the",
+        "hot key.",
+        "",
+        "Sends `amount` USDC from the vault to the whitelisted Collector Crypt",
+        "treasury token account. The `memo` argument must be",
+        "`<memo returned by /api/generatePack>` + `\":open\"` — the API field is",
+        "the bare `<slug>-<uuid>` join key; the BACKEND appends the suffix. A",
+        "Tangem fee of `fee_bps` is charged ON TOP of `amount` into the fee",
+        "treasury, atomically.",
+        "",
+        "CLIENT CONTRACT: the transaction MUST carry a TOP-LEVEL spl-memo",
+        "instruction with the same string — that memo plus the treasury",
+        "transfer (inner CPI transfers are parsed) is what credits the spin.",
+        "No gacha-wallet co-signature and no payer registration are needed;",
+        "submit via any RPC (CC's /api/submitTransaction rejects foreign",
+        "signatures). The",
+        "`memo` arg here is validated and recorded in the PackOpened event for",
+        "reconciliation; the program does NOT emit its own memo instruction —",
+        "CC's indexer only reads the top-level one."
+      ],
+      "discriminator": [
+        75,
+        203,
+        144,
+        65,
+        63,
+        253,
+        103,
+        85
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "hot_delegate",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "usdc_mint"
+        },
+        {
+          "name": "vault_usdc",
+          "docs": [
+            "Pinned to the vault's CANONICAL ATA (not just any vault-owned USDC",
+            "account)."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "account",
+                "path": "vault"
+              },
+              {
+                "kind": "account",
+                "path": "token_program"
+              },
+              {
+                "kind": "account",
+                "path": "usdc_mint"
+              }
+            ],
+            "program": {
+              "kind": "const",
+              "value": [
+                140,
+                151,
+                37,
+                143,
+                78,
+                36,
+                137,
+                241,
+                187,
+                61,
+                16,
+                41,
+                20,
+                142,
+                13,
+                131,
+                11,
+                90,
+                19,
+                153,
+                218,
+                255,
+                16,
+                132,
+                4,
+                142,
+                123,
+                216,
+                219,
+                233,
+                248,
+                89
+              ]
+            }
+          }
+        },
+        {
+          "name": "gacha_usdc",
+          "docs": [
+            "Whitelisted Collector Crypt treasury account — the ONLY spin",
+            "destination the hot delegate can pay. The mint pin turns a wrong-mint",
+            "address in the config into a loud first-spin failure",
+            "(ConstraintTokenMint, 2014) instead of a token-program error mid-CPI."
+          ],
+          "writable": true
+        },
+        {
+          "name": "fee_usdc",
+          "docs": [
+            "The mint pin matters MOST here: while `fee_bps = 0` the fee transfer is",
+            "skipped, so without it a wrong-mint `fee_usdc_account` in the config",
+            "would pass silently for as long as the fee stays zero — and then break",
+            "every spin of every vault the moment the fee is raised. Failing the",
+            "first spin makes the misconfiguration visible at rollout, when it is",
+            "still one `update_config` away from harmless."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        },
+        {
+          "name": "memo",
+          "type": "string"
+        }
+      ]
+    },
+    {
+      "name": "revoke_buyback",
+      "docs": [
+        "Revoke the pNFT transfer delegate and free the buyback slot. Callable",
+        "by cold owner or hot delegate."
+      ],
+      "discriminator": [
+        214,
+        118,
+        102,
+        101,
+        177,
+        127,
+        242,
+        141
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "authority",
+          "docs": [
+            "Cold owner OR hot delegate (checked in the handler); pays fees."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "delegate",
+          "docs": [
+            "that was approved) — validated by the Token Metadata CPI."
+          ]
+        },
+        {
+          "name": "nft_mint"
+        },
+        {
+          "name": "nft_token",
+          "writable": true
+        },
+        {
+          "name": "metadata",
+          "writable": true
+        },
+        {
+          "name": "edition"
+        },
+        {
+          "name": "token_record",
+          "writable": true
+        },
+        {
+          "name": "authorization_rules",
+          "optional": true
+        },
+        {
+          "name": "authorization_rules_program",
+          "docs": [
+            "uniformity with BuybackPnft — the one context whose generated",
+            "`try_accounts` frame cannot take an `address =` constraint. ABSENT is",
+            "encoded by passing THIS PROGRAM's id in this slot (anchor-ts does that",
+            "for null); the slot is not last, so it must be filled, never dropped."
+          ],
+          "optional": true
+        },
+        {
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        },
+        {
+          "name": "sysvar_instructions",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "sweep_prize_ata",
+      "docs": [
+        "PERMISSIONLESS rent sweep: close an EMPTY vault-owned prize token",
+        "account and send its rent to the Collector Crypt gacha wallet fixed in",
+        "the config.",
+        "",
+        "Rationale: CC fronts the rent (~0.002 SOL) for every prize ATA it",
+        "creates when delivering to the vault, and its no-closeAccount buyback",
+        "template (scoped to our API key) leaves that ATA behind — this is the",
+        "agreed recovery path: CC's cron calls this instruction to reclaim its",
+        "rent in batches.",
+        "",
+        "Safe without a signer: it can only close an EMPTY, non-USDC,",
+        "vault-owned token account that the live buyback slot does not point at,",
+        "and it forwards EXACTLY the rent-exempt minimum to the config-pinned CC",
+        "wallet — an arbitrary caller gains nothing and can move nothing but that",
+        "rent. (The cold owner's `close_token_account`, which routes everything to",
+        "the user, remains for self-GC.)",
+        "",
+        "The close lands in the VAULT first and only the rent is forwarded, so",
+        "any lamports beyond it — an unsynced native (wSOL) balance, or SOL",
+        "mistakenly sent to the token-account address — stay with the vault owner",
+        "(recoverable via `withdraw_sol`) instead of riding out to CC. Refusing",
+        "such accounts outright, as an earlier revision did, would have let anyone",
+        "veto a sweep forever by donating one lamport to the ATA.",
+        "",
+        "SCOPE, HONESTLY: the guards below do not — and cannot cheaply — verify",
+        "that CC actually funded the account. Any EMPTY non-USDC vault-owned token",
+        "account is in scope, including one whose rent the user paid."
+      ],
+      "discriminator": [
+        68,
+        115,
+        36,
+        117,
+        204,
+        209,
+        252,
+        144
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "vault",
+          "docs": [
+            "Writable: the closed account's lamports land here first, and only the",
+            "rent-exempt minimum is forwarded on to `rent_destination`."
+          ],
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "vault.cold_owner",
+                "account": "Vault"
+              }
+            ]
+          }
+        },
+        {
+          "name": "token",
+          "writable": true
+        },
+        {
+          "name": "rent_destination",
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "update_config",
+      "docs": [
+        "Admin-only partial updates of the global config."
+      ],
+      "discriminator": [
+        29,
+        158,
+        252,
+        191,
+        10,
+        83,
+        219,
+        99
+      ],
+      "accounts": [
+        {
+          "name": "config",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  99,
+                  111,
+                  110,
+                  102,
+                  105,
+                  103
+                ]
+              }
+            ]
+          }
+        },
+        {
+          "name": "admin",
+          "signer": true,
+          "relations": [
+            "config"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "new_admin",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "gacha_wallet",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "gacha_usdc_account",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "fee_usdc_account",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "fee_bps",
+          "type": {
+            "option": "u16"
+          }
+        },
+        {
+          "name": "paused",
+          "type": {
+            "option": "bool"
+          }
+        },
+        {
+          "name": "allow_buyback_delegation",
+          "type": {
+            "option": "bool"
+          }
+        }
+      ]
+    },
+    {
+      "name": "update_vault",
+      "docs": [
+        "Cold-key-only: rotate the hot delegate and/or adjust caps."
+      ],
+      "discriminator": [
+        67,
+        229,
+        185,
+        188,
+        226,
+        11,
+        210,
+        60
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        }
+      ],
+      "args": [
+        {
+          "name": "hot_delegate",
+          "type": {
+            "option": "pubkey"
+          }
+        },
+        {
+          "name": "per_spin_cap",
+          "type": {
+            "option": "u64"
+          }
+        },
+        {
+          "name": "daily_cap",
+          "type": {
+            "option": "u64"
+          }
+        }
+      ]
+    },
+    {
+      "name": "withdraw_core",
+      "docs": [
+        "Cold-key-only: withdraw a Metaplex CORE prize (AssetV1 — the standard",
+        "most current CC prizes use; no token accounts, the owner lives inside",
+        "the asset) from the vault to any wallet.",
+        "",
+        "CC Core assets are NOT frozen (their PermanentFreezeDelegate ships",
+        "frozen=false), so a plain owner transfer works — a single CPI, far",
+        "lighter than withdraw_pnft. TRUST NOTE: CC's Core collection carries",
+        "PermanentTransferDelegate/PermanentBurnDelegate (authority = CC), so",
+        "CC can move or burn any Core prize regardless of custody — for Core",
+        "prizes the vault protects against key theft, not against CC. This is no",
+        "longer the ONLY exit for a Core asset either: `buyback_core` moves one",
+        "on `cc_authority` + `hot_delegate` signatures, without the cold key."
+      ],
+      "discriminator": [
+        49,
+        97,
+        48,
+        114,
+        218,
+        116,
+        73,
+        96
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "payer",
+          "docs": [
+            "Fee payer (typically the phone) so the cold-signed message stays small."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "asset",
+          "docs": [
+            "validated by the mpl-core CPI (it refuses to transfer an asset the vault",
+            "does not own)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "collection",
+          "docs": [
+            "authority) — mpl-core binds it to the asset itself; see BuybackCore."
+          ]
+        },
+        {
+          "name": "destination_owner"
+        },
+        {
+          "name": "mpl_core_program",
+          "address": "CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "withdraw_pnft",
+      "docs": [
+        "Cold-key-only: withdraw a prize pNFT from the vault to any wallet",
+        "(typically the user's cold address for long-term storage). Goes through",
+        "Token Metadata TransferV1 because pNFT token accounts are frozen.",
+        "",
+        "NOTE for integrating clients: this instruction carries exactly 18",
+        "accounts, always. The two auth-rules slots are Anchor-optional, which",
+        "means an absent one is passed as THIS PROGRAM's id, not omitted — the",
+        "slots are not last, so dropping them shifts the five accounts after them",
+        "and fails. CC cards carry the Metaplex Foundation Rule Set, so in",
+        "practice both hold real accounts. The cold key only signs; the phone",
+        "should be the fee payer. Validate the total message size against the",
+        "Tangem card signing budget.",
+        "",
+        "REQUIRED: the pNFT TransferV1 (create destination ATA + TokenRecord +",
+        "rule-set eval) does NOT fit the default 200k compute units. The client",
+        "MUST prepend a `ComputeBudgetInstruction::set_compute_unit_limit(300_000)`",
+        "or the transaction fails on-chain with \"exceeded CUs meter\" (negative",
+        "control: tests/pnft.rs `withdraw_pnft_cold_only_and_within_packet_budget`).",
+        "Measured cold-signed message 682 B / serialized tx 811 B incl. that ix."
+      ],
+      "discriminator": [
+        208,
+        1,
+        50,
+        181,
+        217,
+        48,
+        202,
+        162
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "payer",
+          "docs": [
+            "Fee/rent payer (typically the phone) so the cold-signed message stays",
+            "as small as possible."
+          ],
+          "writable": true,
+          "signer": true
+        },
+        {
+          "name": "nft_mint"
+        },
+        {
+          "name": "nft_token",
+          "writable": true
+        },
+        {
+          "name": "destination_owner"
+        },
+        {
+          "name": "destination_token",
+          "docs": [
+            "by the Token Metadata CPI when missing, validated there."
+          ],
+          "writable": true
+        },
+        {
+          "name": "metadata",
+          "writable": true
+        },
+        {
+          "name": "edition"
+        },
+        {
+          "name": "token_record",
+          "writable": true
+        },
+        {
+          "name": "destination_token_record",
+          "writable": true
+        },
+        {
+          "name": "authorization_rules",
+          "optional": true
+        },
+        {
+          "name": "authorization_rules_program",
+          "docs": [
+            "uniformity with BuybackPnft — the one context whose generated",
+            "`try_accounts` frame cannot take an `address =` constraint. ABSENT is",
+            "encoded by passing THIS PROGRAM's id in this slot (anchor-ts does that",
+            "for null); the slot is not last, so it must be filled, never dropped."
+          ],
+          "optional": true
+        },
+        {
+          "name": "token_metadata_program",
+          "address": "metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s"
+        },
+        {
+          "name": "sysvar_instructions",
+          "address": "Sysvar1nstructions1111111111111111111111111"
+        },
+        {
+          "name": "ata_program",
+          "address": "ATokenGPvbdGVxr1b2hvZbsiqW5xWH25efTNsLJA8knL"
+        },
+        {
+          "name": "token_program"
+        },
+        {
+          "name": "system_program",
+          "address": "11111111111111111111111111111111"
+        }
+      ],
+      "args": []
+    },
+    {
+      "name": "withdraw_sol",
+      "docs": [
+        "Cold-key-only: withdraw excess SOL from the vault PDA. Keeps the vault",
+        "rent-exempt."
+      ],
+      "discriminator": [
+        145,
+        131,
+        74,
+        136,
+        65,
+        137,
+        42,
+        38
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "writable": true,
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "recipient",
+          "writable": true
+        }
+      ],
+      "args": [
+        {
+          "name": "lamports",
+          "type": "u64"
+        }
+      ]
+    },
+    {
+      "name": "withdraw_token",
+      "docs": [
+        "Cold-key-only: withdraw a fungible SPL asset (USDC) from the vault to",
+        "any destination token account (other than the source itself)."
+      ],
+      "discriminator": [
+        136,
+        235,
+        181,
+        5,
+        101,
+        109,
+        57,
+        81
+      ],
+      "accounts": [
+        {
+          "name": "vault",
+          "pda": {
+            "seeds": [
+              {
+                "kind": "const",
+                "value": [
+                  118,
+                  97,
+                  117,
+                  108,
+                  116
+                ]
+              },
+              {
+                "kind": "account",
+                "path": "cold_owner"
+              }
+            ]
+          }
+        },
+        {
+          "name": "cold_owner",
+          "signer": true,
+          "relations": [
+            "vault"
+          ]
+        },
+        {
+          "name": "source",
+          "writable": true
+        },
+        {
+          "name": "mint"
+        },
+        {
+          "name": "destination",
+          "docs": [
+            "Any token account of the same mint — destination is the cold owner's",
+            "free choice, except the source itself (rejected in the handler)."
+          ],
+          "writable": true
+        },
+        {
+          "name": "token_program"
+        }
+      ],
+      "args": [
+        {
+          "name": "amount",
+          "type": "u64"
+        }
+      ]
+    }
+  ],
+  "accounts": [
+    {
+      "name": "Config",
+      "discriminator": [
+        155,
+        12,
+        170,
+        224,
+        30,
+        250,
+        204,
+        130
+      ]
+    },
+    {
+      "name": "Vault",
+      "discriminator": [
+        211,
+        8,
+        232,
+        43,
+        2,
+        152,
+        117,
+        119
+      ]
+    }
+  ],
+  "events": [
+    {
+      "name": "BuybackApproved",
+      "discriminator": [
+        218,
+        207,
+        181,
+        48,
+        54,
+        71,
+        153,
+        224
+      ]
+    },
+    {
+      "name": "BuybackExecuted",
+      "discriminator": [
+        150,
+        109,
+        157,
+        10,
+        124,
+        24,
+        38,
+        189
+      ]
+    },
+    {
+      "name": "BuybackSlotCleared",
+      "discriminator": [
+        100,
+        190,
+        209,
+        96,
+        112,
+        101,
+        254,
+        140
+      ]
+    },
+    {
+      "name": "ConfigUpdated",
+      "discriminator": [
+        40,
+        241,
+        230,
+        122,
+        11,
+        19,
+        198,
+        194
+      ]
+    },
+    {
+      "name": "DelegateRevoked",
+      "discriminator": [
+        10,
+        200,
+        133,
+        29,
+        238,
+        207,
+        193,
+        124
+      ]
+    },
+    {
+      "name": "HotDelegateRotated",
+      "discriminator": [
+        198,
+        41,
+        190,
+        71,
+        107,
+        229,
+        118,
+        136
+      ]
+    },
+    {
+      "name": "PackOpened",
+      "discriminator": [
+        107,
+        111,
+        64,
+        235,
+        140,
+        166,
+        46,
+        201
+      ]
+    },
+    {
+      "name": "PrizeAtaSwept",
+      "discriminator": [
+        228,
+        217,
+        248,
+        253,
+        225,
+        254,
+        116,
+        51
+      ]
+    },
+    {
+      "name": "SolWithdrawn",
+      "discriminator": [
+        145,
+        249,
+        69,
+        48,
+        206,
+        86,
+        91,
+        66
+      ]
+    },
+    {
+      "name": "TokenAccountClosed",
+      "discriminator": [
+        58,
+        175,
+        118,
+        169,
+        94,
+        175,
+        37,
+        5
+      ]
+    },
+    {
+      "name": "TokenWithdrawn",
+      "discriminator": [
+        35,
+        57,
+        130,
+        51,
+        154,
+        247,
+        155,
+        142
+      ]
+    },
+    {
+      "name": "VaultClosed",
+      "discriminator": [
+        238,
+        129,
+        38,
+        228,
+        227,
+        118,
+        249,
+        215
+      ]
+    },
+    {
+      "name": "VaultInitialized",
+      "discriminator": [
+        180,
+        43,
+        207,
+        2,
+        18,
+        71,
+        3,
+        75
+      ]
+    }
+  ],
+  "errors": [
+    {
+      "code": 6000,
+      "name": "Paused",
+      "msg": "Program is paused"
+    },
+    {
+      "code": 6001,
+      "name": "ZeroAmount",
+      "msg": "Amount must be greater than zero"
+    },
+    {
+      "code": 6002,
+      "name": "InvalidMemo",
+      "msg": "Memo is empty or too long"
+    },
+    {
+      "code": 6003,
+      "name": "InvalidFeeBps",
+      "msg": "Fee basis points out of range"
+    },
+    {
+      "code": 6004,
+      "name": "InvalidCaps",
+      "msg": "Caps must satisfy 0 < per_spin_cap <= daily_cap"
+    },
+    {
+      "code": 6005,
+      "name": "ExceedsPerSpinCap",
+      "msg": "Amount exceeds per-spin cap"
+    },
+    {
+      "code": 6006,
+      "name": "ExceedsDailyCap",
+      "msg": "Amount exceeds the daily cap"
+    },
+    {
+      "code": 6007,
+      "name": "MathOverflow",
+      "msg": "Arithmetic overflow"
+    },
+    {
+      "code": 6008,
+      "name": "NotAnNft",
+      "msg": "Token account does not look like a prize NFT"
+    },
+    {
+      "code": 6009,
+      "name": "BuybackDelegationDisabled",
+      "msg": "Buyback delegation is disabled"
+    },
+    {
+      "code": 6010,
+      "name": "BuybackSlotOccupied",
+      "msg": "Another buyback delegate is already live for this vault"
+    },
+    {
+      "code": 6011,
+      "name": "NoLiveBuyback",
+      "msg": "No live buyback delegate to clear"
+    },
+    {
+      "code": 6012,
+      "name": "WrongBuybackToken",
+      "msg": "Token account is not the one recorded for the live buyback"
+    },
+    {
+      "code": 6013,
+      "name": "BuybackStillActive",
+      "msg": "The delegated NFT is still in the vault with a live delegate"
+    },
+    {
+      "code": 6014,
+      "name": "VaultNotClean",
+      "msg": "Vault has a live buyback delegate; revoke before closing"
+    },
+    {
+      "code": 6015,
+      "name": "TokenAccountNotEmpty",
+      "msg": "Token account is not empty"
+    },
+    {
+      "code": 6016,
+      "name": "DelegateStillSet",
+      "msg": "Token account still has a delegate — revoke first"
+    },
+    {
+      "code": 6017,
+      "name": "InsufficientSol",
+      "msg": "Insufficient SOL above rent-exempt minimum"
+    },
+    {
+      "code": 6018,
+      "name": "Unauthorized",
+      "msg": "Account is not authorized for this operation"
+    },
+    {
+      "code": 6019,
+      "name": "CannotSweepUsdc",
+      "msg": "The vault USDC account cannot be swept"
+    },
+    {
+      "code": 6020,
+      "name": "ExcessLamports",
+      "msg": "Token account holds lamports above the rent-exempt minimum"
+    },
+    {
+      "code": 6021,
+      "name": "UnsupportedMint",
+      "msg": "USDC mint must be a legacy SPL Token mint"
+    }
+  ],
+  "types": [
+    {
+      "name": "BuybackApproved",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "nft_mint",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BuybackExecuted",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "price",
+            "type": "u64"
+          },
+          {
+            "name": "memo",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "BuybackSlotCleared",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_account",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Config",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "usdc_mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "gacha_wallet",
+            "docs": [
+              "CC's operator wallet. LOAD-BEARING FOR CUSTODY, not just for routing:",
+              "it is the rent destination of `sweep_prize_ata` AND the `address =` pin",
+              "on `cc_authority`, i.e. the only key that may execute a buyback — one",
+              "that sends the prize to an unconstrained `destination_owner` of the",
+              "signer's choosing. Admin-writable in one step, so admin +",
+              "a vault's hot key can move that vault's prizes out at any price > 0.",
+              "Repointing it is also the surgical way to disable both buybacks",
+              "globally without stopping spins."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "gacha_usdc_account",
+            "docs": [
+              "Exact USDC token account that receives spin payments. Admin-writable in",
+              "one step, and it is the ONLY destination check `open_pack` performs —",
+              "repointing it silently diverts every future spin payment, from every",
+              "vault, with no hot key involved. Value-bearing, not bookkeeping."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_usdc_account",
+            "docs": [
+              "Tangem fee treasury USDC token account. Admin-writable in one step; same",
+              "diversion property as `gacha_usdc_account`, for the fee leg."
+            ],
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_bps",
+            "docs": [
+              "Tangem fee charged on top of the spin price, in basis points",
+              "(hard-capped at MAX_FEE_BPS)."
+            ],
+            "type": "u16"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "_reserved",
+            "docs": [
+              "Layout padding left by the removed `allow_usdc_delegation` flag; kept so",
+              "already-deployed configs stay layout-compatible. Nothing reads it, and",
+              "`initialize_config` writes false — but the LIVE devnet config still",
+              "carries 1 from the Plan-B era, so any future repurposing must treat 1,",
+              "not 0, as the pre-existing value. (A `bool` also rejects any byte other",
+              "than 0/1 on deserialize; prefer `u8` when the mainnet layout is cut.)"
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "allow_buyback_delegation",
+            "docs": [
+              "Enables `approve_buyback` (pNFT transfer delegation to the hot key) and",
+              "NOTHING else — in particular it does not gate `buyback_pnft` /",
+              "`buyback_core`, which need no delegate. Set it false once CC's backend",
+              "has migrated to those, which retires the standing-delegate drain risk."
+            ],
+            "type": "bool"
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "ConfigUpdated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "admin",
+            "type": "pubkey"
+          },
+          {
+            "name": "gacha_wallet",
+            "type": "pubkey"
+          },
+          {
+            "name": "gacha_usdc_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_usdc_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "fee_bps",
+            "type": "u16"
+          },
+          {
+            "name": "paused",
+            "type": "bool"
+          },
+          {
+            "name": "allow_buyback_delegation",
+            "type": "bool"
+          }
+        ]
+      }
+    },
+    {
+      "name": "DelegateRevoked",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_account",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "HotDelegateRotated",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "hot_delegate",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PackOpened",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "cold_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          },
+          {
+            "name": "fee",
+            "type": "u64"
+          },
+          {
+            "name": "memo",
+            "type": "string"
+          }
+        ]
+      }
+    },
+    {
+      "name": "PrizeAtaSwept",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_account",
+            "type": "pubkey"
+          },
+          {
+            "name": "rent_refund",
+            "docs": [
+              "Lamports forwarded to `config.gacha_wallet` — exactly the closed",
+              "account's rent-exempt minimum. Anything the account held above it stays",
+              "in the vault."
+            ],
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "SolWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "recipient",
+            "type": "pubkey"
+          },
+          {
+            "name": "lamports",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenAccountClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "token_account",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "TokenWithdrawn",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "mint",
+            "type": "pubkey"
+          },
+          {
+            "name": "amount",
+            "type": "u64"
+          }
+        ]
+      }
+    },
+    {
+      "name": "Vault",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "cold_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "hot_delegate",
+            "type": "pubkey"
+          },
+          {
+            "name": "per_spin_cap",
+            "docs": [
+              "Max USDC (incl. fee) a single spin may spend."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "daily_cap",
+            "docs": [
+              "Max USDC (incl. fees) spendable per UTC day."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "spent_today",
+            "docs": [
+              "Rolled LAZILY — only `open_pack` calls `roll_day`. Meaningful just while",
+              "`day_index == unix_timestamp.div_euclid(86_400)`; against a stale bucket",
+              "the real remaining allowance is the full `daily_cap`, so a client",
+              "reading this field raw can under-report it by up to one cap."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "day_index",
+            "docs": [
+              "UTC day bucket (unix_timestamp / 86400) for `spent_today`."
+            ],
+            "type": "i64"
+          },
+          {
+            "name": "_reserved",
+            "docs": [
+              "Layout padding left by a removed legacy field; kept so already-deployed",
+              "vaults stay layout-compatible. Always 0."
+            ],
+            "type": "u64"
+          },
+          {
+            "name": "live_buyback_mint",
+            "docs": [
+              "Mint of the single pNFT whose transfer delegate is currently live.",
+              "approve_buyback fails while occupied. Freed by revoke_buyback, by",
+              "clear_buyback_slot (with on-chain proof the NFT left / delegate gone),",
+              "or by buyback_pnft when it moves this exact token — that owner-path",
+              "transfer consumes the delegate, so no clear_buyback_slot is needed",
+              "afterwards; calling one then fails with Anchor AccountNotInitialized",
+              "(3012) on `nft_token`, because that ATA was closed in the same",
+              "instruction (see clear_buyback_slot)."
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "live_buyback_token",
+            "docs": [
+              "The EXACT token account that was delegated (not just its mint). The slot",
+              "can only be freed by presenting this same account with an empty balance",
+              "or no delegate — a decoy same-mint vault account cannot forge completion."
+            ],
+            "type": {
+              "option": "pubkey"
+            }
+          },
+          {
+            "name": "bump",
+            "type": "u8"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultClosed",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "cold_owner",
+            "type": "pubkey"
+          }
+        ]
+      }
+    },
+    {
+      "name": "VaultInitialized",
+      "type": {
+        "kind": "struct",
+        "fields": [
+          {
+            "name": "vault",
+            "type": "pubkey"
+          },
+          {
+            "name": "cold_owner",
+            "type": "pubkey"
+          },
+          {
+            "name": "hot_delegate",
+            "type": "pubkey"
+          }
+        ]
+      }
+    }
+  ]
+}

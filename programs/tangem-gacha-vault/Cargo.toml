@@ -1,0 +1,37 @@
+[package]
+name = "tangem-gacha-vault"
+version = "0.1.0"
+description = "Tangem Collectibles: delegated-access vault for Collector Crypt Gacha (open pack / buyback without cold-key taps)"
+edition = "2021"
+
+[lib]
+crate-type = ["cdylib", "lib"]
+name = "tangem_gacha_vault"
+
+[features]
+default = []
+cpi = ["no-entrypoint"]
+no-entrypoint = []
+no-idl = []
+no-log-ix-name = []
+idl-build = ["anchor-lang/idl-build", "anchor-spl/idl-build"]
+
+[dependencies]
+anchor-lang = "0.31.1"
+anchor-spl = "0.31.1"
+mpl-token-metadata = "5.1"
+
+[dev-dependencies]
+# litesvm 0.8+ targets solana 3.x and conflicts with anchor 0.31 (solana 2.x);
+# 0.7.x rides agave 2.3 runtime crates (agave-feature-set), matching the
+# solana-sdk 2.3 interface crates this lockfile resolves to. 0.6.x is out:
+# it expects the discontinued solana-feature-set and no longer compiles
+# against agave >= 2.2.14 runtime crates.
+litesvm = "0.7"
+solana-sdk = "2.3"
+# Reading tests/fixtures/cc_rule_set.json (mainnet account dump) in pnft.rs.
+serde_json = "1"
+base64 = "0.22"
+# solana-sdk's secp256r1 precompile pulls openssl-sys; vendored = build from
+# source so no preinstalled OpenSSL is needed (perl + a C compiler suffice).
+openssl = { version = "0.10", features = ["vendored"] }

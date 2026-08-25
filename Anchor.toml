@@ -1,0 +1,38 @@
+[toolchain]
+anchor_version = "0.31.1"
+
+[features]
+resolution = true
+skip-lint = false
+
+[programs.localnet]
+tangem_gacha_vault = "29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u"
+
+[provider]
+cluster = "Localnet"
+wallet = "~/.config/solana/id.json"
+
+[scripts]
+test = "yarn run ts-mocha -p ./tsconfig.json -t 1000000 tests/**/*.ts"
+
+# Without this entry `anchor test` genesis-loads the program via the legacy
+# --bpf-program flag, which leaves the upgrade authority unset (111...1) and
+# initialize_config's upgrade-authority gate can never pass. upgradeable = true
+# switches it to --upgradeable-program with authority = the provider wallet.
+[[test.genesis]]
+address = "29agFEruMu2jedVwnDgKPuq7ejmTiB7sEqzdhufQQS9u"
+program = "target/deploy/tangem_gacha_vault.so"
+upgradeable = true
+
+# The TS suite is hermetic (no network needed). The pNFT/Core integration
+# tests (programs/tangem-gacha-vault/tests/{pnft,core}.rs) load program and
+# account dumps from tests/fixtures/, refreshed with:
+#   solana program dump -u m metaqbxxUerdq28cj1RbAWkYQm3ybzjb6a8bt518x1s tests/fixtures/mpl_token_metadata.so
+#   solana program dump -u m auth9SigNpDKz4sJJ1DfCTuZrZNSAgh9sFD3rboVmgg tests/fixtures/mpl_token_auth_rules.so
+#   solana program dump -u m CoREENxT6tW1HoK8ypY1SxRMZTcVPm7R94rH4PZNhX7d tests/fixtures/mpl_core.so
+#   solana account -u m eBJLFYPxJmMGKuFwpDWkzxZeUrad92kZRC5BJLpzyT9 --output json --output-file tests/fixtures/cc_rule_set.json
+#   # real CC Core prize + collection accounts (devnet):
+#   solana account -u d 13fCVtpxtzN8mv8jERe6Ev7rSuXM4nbSwFGhmauvKB7b --output json --output-file tests/fixtures/cc_core_asset.json
+#   solana account -u d CCryptUfeFSZ3Fgc9FLeKrhLVAP67FSqi1GuVoj9CRac --output json --output-file tests/fixtures/cc_core_collection.json
+# To use them from the TS suite too, add [[test.genesis]] entries for the
+# programs and [[test.validator.account]] entries for the account dumps.
