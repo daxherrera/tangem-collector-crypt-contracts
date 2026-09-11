@@ -1,0 +1,9 @@
+target/
+.anchor/
+node_modules/
+test-ledger/
+build.log
+keys/
+*.so
+!tests/fixtures/*.so
+.DS_Store

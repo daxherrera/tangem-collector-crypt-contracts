@@ -88,26 +88,59 @@ while read -r id file; do
 done <<< "$PROGRAMS"
 
 # --- SBF stack guard -------------------------------------------------------
-# BuybackPnft's generated try_accounts sits ~8 bytes under the 4 KB SBF stack
-# frame limit, so one more `#[account(address = ...)]` in that context pushes it
-# over. The toolchain only WARNS and still emits the .so, which is why lib.rs
-# pins the auth-rules program in the handler instead. This is the check that
-# comment refers to: fail the build log rather than ship a silently-overflowing
-# binary.
+# A generated try_accounts frame that exceeds the 4 KB SBF limit is only a
+# WARNING: cargo/anchor exit 0 and still write the .so. In that artifact the
+# spilled bytes corrupt deserialization — OpenPack overflowing by 8 bytes made
+# `config.paused` read true from a zero byte, killing every spin with error
+# 6000. So the log must be checked, and NOT checking it must fail too.
+#
+# This used to default to SKIPPED and then print "Safe to deploy" with exit 0,
+# which is the same outcome as passing for anyone reading the exit code.
 echo
-if [ -f "$STACK_LOG" ]; then
-  if grep -q "Stack offset" "$STACK_LOG"; then
-    echo "STACK OVERFLOW in $STACK_LOG:"
-    grep -n "Stack offset" "$STACK_LOG" | head -5
-    echo "  ^ a generated try_accounts frame exceeded the 4 KB SBF limit."
-    echo "    cargo/anchor exit 0 on this and still write the .so — do not deploy."
+if [ -z "$STACK_LOG" ]; then
+  echo "FAIL     SBF stack check not run — no build log supplied."
+  echo "         anchor build 2>&1 | tee build.log && STACK_LOG=build.log $0"
+  drift=1
+elif [ ! -f "$STACK_LOG" ]; then
+  echo "FAIL     SBF stack check not run — '$STACK_LOG' does not exist."
+  drift=1
+elif grep -q "Stack offset" "$STACK_LOG"; then
+  echo "STACK OVERFLOW in $STACK_LOG:"
+  grep -n "Stack offset" "$STACK_LOG" | head -5
+  echo "  ^ a generated try_accounts frame exceeded the 4 KB SBF limit."
+  echo "    cargo/anchor exit 0 on this and still write the .so — do not deploy."
+  drift=1
+else
+  echo "OK       no SBF stack-offset warning in $STACK_LOG"
+fi
+
+# cc_buyback.so is NOT a mainnet fixture — it is not deployed anywhere, so there
+# is nothing to diff it against. It is hand-copied from
+# gachamachine/solana/target/deploy, and a stale copy is the quiet failure mode:
+# the suite goes green against the PREVIOUS ABI. Pin its hash so an accidental or
+# forgotten swap is visible, and so the pin has to be updated deliberately when
+# CC ships a new build.
+echo
+CC_SO=tests/fixtures/cc_buyback.so
+CC_PIN=tests/fixtures/cc_buyback.so.sha256
+if [ ! -f "$CC_SO" ]; then
+  echo "FAIL     $CC_SO missing — copy it from gachamachine/solana/target/deploy."
+  drift=1
+elif [ ! -f "$CC_PIN" ]; then
+  echo "FAIL     $CC_PIN missing — record it with: shasum -a 256 $CC_SO | awk '{print \$1}' > $CC_PIN"
+  drift=1
+else
+  have=$(shasum -a 256 "$CC_SO" | awk '{print $1}')
+  want=$(tr -d '[:space:]' < "$CC_PIN")
+  if [ "$have" != "$want" ]; then
+    echo "FAIL     cc_buyback.so does not match its pin."
+    echo "         pinned $want"
+    echo "         actual $have"
+    echo "         If CC shipped a new build, update the pin in the same commit."
     drift=1
   else
-    echo "OK       no SBF stack-offset warning in $STACK_LOG"
+    echo "OK       cc_buyback.so matches its pin (${have:0:16}...)"
   fi
-else
-  echo "SKIPPED  SBF stack check — pass a build log: STACK_LOG=build.log $0"
-  echo "         (anchor build 2>&1 | tee build.log)"
 fi
 
 echo
@@ -115,4 +148,4 @@ if [ "$drift" -ne 0 ]; then
   echo "FIXTURE DRIFT — do not deploy until reviewed (see above)."
   exit 1
 fi
-echo "All $checked fixtures match mainnet-beta. Safe to deploy."
+echo "All $checked fixtures match mainnet-beta, SBF stack clean. Safe to deploy."

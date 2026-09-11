@@ -282,8 +282,9 @@ fn install_usdc_world(w: &mut World, cc: &Keypair) -> (Pubkey, Pubkey, Pubkey, P
     let (config_pda, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint,
-        gacha_wallet: cc.pubkey(),
+        rent_destination: cc.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
         fee_bps: 0,
@@ -291,6 +292,7 @@ fn install_usdc_world(w: &mut World, cc: &Keypair) -> (Pubkey, Pubkey, Pubkey, P
         _reserved: false,
         allow_buyback_delegation: true,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();
@@ -684,8 +686,9 @@ fn buyback_core_rejects_paused_and_zero_price() {
     let (config_pda, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint,
-        gacha_wallet: cc.pubkey(),
+        rent_destination: cc.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
         fee_bps: 0,
@@ -693,6 +696,7 @@ fn buyback_core_rejects_paused_and_zero_price() {
         _reserved: false,
         allow_buyback_delegation: true,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();

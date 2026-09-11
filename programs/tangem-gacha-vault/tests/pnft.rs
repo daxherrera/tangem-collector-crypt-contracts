@@ -10,6 +10,11 @@
 
 mod common;
 
+use common::{
+    cc_ed25519_ix, cc_policy_pda, cc_quote_digest, cc_quote_marker_pda, cc_rent_vault_pda,
+    plant_cc_policy, CcLane,
+};
+
 use anchor_lang::{AccountDeserialize, AccountSerialize, InstructionData, ToAccountMetas};
 use base64::Engine;
 use litesvm::LiteSVM;
@@ -18,15 +23,19 @@ use mpl_token_metadata::instructions::{CreateV1Builder, MintV1Builder, TransferV
 use mpl_token_metadata::types::{Collection, Creator, PrintSupply, TokenDelegateRole, TokenStandard};
 use solana_sdk::{
     account::Account,
+    address_lookup_table::AddressLookupTableAccount,
     compute_budget::ComputeBudgetInstruction,
     instruction::{AccountMeta, Instruction},
+    message::{v0, VersionedMessage},
     pubkey,
     pubkey::Pubkey,
     signature::{Keypair, Signer},
     system_instruction, system_program, sysvar,
-    transaction::Transaction,
+    transaction::{Transaction, VersionedTransaction},
 };
-use tangem_gacha_vault::{accounts, instruction, Config, Vault, CONFIG_SEED, VAULT_SEED};
+use tangem_gacha_vault::{
+    accounts, instruction, Config, Vault, CC_BUYBACK_ID, CONFIG_SEED, VAULT_SEED,
+};
 
 const PROGRAM_ID: Pubkey = tangem_gacha_vault::ID;
 const AUTH_RULES_PROGRAM_ID: Pubkey = pubkey!("auth9SigNpDKz4sJJ1DfCTuZrZNSAgh9sFD3rboVmgg");
@@ -88,8 +97,9 @@ fn write_config(svm: &mut LiteSVM, allow_buyback_delegation: bool, paused: bool)
     let (config_pda, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint: Pubkey::new_unique(),
-        gacha_wallet: Pubkey::new_unique(),
+        rent_destination: Pubkey::new_unique(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
         fee_bps: 0,
@@ -97,6 +107,7 @@ fn write_config(svm: &mut LiteSVM, allow_buyback_delegation: bool, paused: bool)
         _reserved: false,
         allow_buyback_delegation,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();
@@ -1471,8 +1482,9 @@ fn patch_config(w: &mut World, usdc_mint: Pubkey, paused: bool) {
     let (config_pda, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint,
-        gacha_wallet: w.cc_operator.pubkey(),
+        rent_destination: w.cc_operator.pubkey(),
         gacha_usdc_account: Pubkey::new_unique(),
         fee_usdc_account: Pubkey::new_unique(),
         fee_bps: 0,
@@ -1480,6 +1492,7 @@ fn patch_config(w: &mut World, usdc_mint: Pubkey, paused: bool) {
         _reserved: false,
         allow_buyback_delegation: true,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();
@@ -1847,4 +1860,276 @@ fn buyback_pnft_rejects_non_canonical_vault_usdc() {
         "non-canonical vault USDC account",
     );
     assert_eq!(spl_amount(&w, &p.token), 1, "prize stays in the vault");
+}
+
+// ===========================================================================
+// buyback_pnft_v2 — CC signs a quote, not this transaction
+// ===========================================================================
+//
+// 24 accounts, which does not fit a legacy packet, so the client builds a v0
+// transaction against CC's frozen address lookup table. Both facts are pinned
+// below: the legacy form must be over budget and the v0 form must be under it,
+// so the ALT dependency can never regress silently in either direction.
+
+/// The CC side of a v2 buyback: cc_buyback's program, its policy, and a USDC
+/// treasury delegated to its policy PDA.
+///
+/// Reconstructed helper — the wire-format declarations it used to sit beside now
+/// live in common/mod.rs, shared with cc_buyback_v2.rs.
+struct V2World {
+    destination: Pubkey,
+    usdc_mint: Pubkey,
+    cc_usdc: Pubkey,
+    vault_usdc: Pubkey,
+    cc_policy: Pubkey,
+    quote_signer: Keypair,
+}
+
+fn setup_v2(w: &mut World) -> V2World {
+    w.svm
+        .add_program_from_file(CC_BUYBACK_ID, fixture("cc_buyback.so"))
+        .expect("cc_buyback.so — copy it from gachamachine/solana/target/deploy");
+
+    let (usdc_mint, vault_usdc, cc_usdc) = install_usdc(w);
+    let (cc_policy, cc_bump) = cc_policy_pda();
+    let quote_signer = Keypair::new();
+    let destination = Pubkey::new_unique();
+
+    // cc_buyback pulls as spl-token DELEGATE; the treasury's owner stays CC's
+    // wallet, which is what keeps the Alchemy webhook's payer predicate true.
+    delegate_spl(w, &cc_usdc, &cc_policy, 500_000_000);
+
+    plant_cc_policy(
+        &mut w.svm,
+        cc_policy,
+        cc_bump,
+        quote_signer.pubkey(),
+        &[destination],
+        &[CcLane { mint: usdc_mint, treasury: cc_usdc }],
+    );
+
+    // cc_buyback fronts the quote marker's rent from its own PDA, so the phone
+    // never pays for CC's bookkeeping. Unfunded, every buyback fails.
+    w.svm.airdrop(&cc_rent_vault_pda().0, 1_000_000_000).unwrap();
+
+    V2World { destination, usdc_mint, cc_usdc, vault_usdc, cc_policy, quote_signer }
+}
+
+/// spl-token `approve`, written straight into the account: the delegate sits at
+/// [72..108] behind a 4-byte COption tag, delegated_amount at [121..129].
+fn delegate_spl(w: &mut World, token: &Pubkey, delegate: &Pubkey, amount: u64) {
+    let mut acct = w.svm.get_account(token).expect("token account");
+    acct.data[72..76].copy_from_slice(&1u32.to_le_bytes());
+    acct.data[76..108].copy_from_slice(delegate.as_ref());
+    acct.data[121..129].copy_from_slice(&amount.to_le_bytes());
+    w.svm.set_account(*token, acct).unwrap();
+}
+
+fn buyback_pnft_v2_ix(w: &World, v: &V2World, p: &Prize, price: u64, quote_id: u64, expires_at: i64) -> Instruction {
+    // Keyed on the digest, so the caller recomputes it — what a real integrator does.
+    let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, expires_at, quote_id, CC_BUYBACK_MEMO);
+    Instruction {
+        program_id: PROGRAM_ID,
+        accounts: accounts::BuybackPnftV2 {
+            cc_quote_marker: cc_quote_marker_pda(&digest),
+            cc_rent_vault: cc_rent_vault_pda().0,
+            config: Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
+            vault: w.vault,
+            hot_delegate: w.hot.pubkey(),
+            cc_authority: w.cc_operator.pubkey(),
+            destination_owner: v.destination,
+            usdc_mint: v.usdc_mint,
+            cc_usdc: v.cc_usdc,
+            vault_usdc: v.vault_usdc,
+            nft_mint: p.mint,
+            nft_token: p.token,
+            destination_token: ata(&v.destination, &p.mint),
+            metadata: p.metadata,
+            edition: p.edition,
+            token_record: p.token_record,
+            destination_token_record: TokenRecord::find_pda(&p.mint, &ata(&v.destination, &p.mint)).0,
+            authorization_rules: Some(CC_RULE_SET),
+            authorization_rules_program: Some(AUTH_RULES_PROGRAM_ID),
+            token_metadata_program: mpl_token_metadata::ID,
+            sysvar_instructions: solana_sdk::sysvar::instructions::ID,
+            ata_program: ATA_PROGRAM_ID,
+            cc_program: CC_BUYBACK_ID,
+            cc_policy: v.cc_policy,
+            token_program: TOKEN_PROGRAM_ID,
+            system_program: system_program::ID,
+        }
+        .to_account_metas(None),
+        data: instruction::BuybackPnftV2 { price, quote_id, expires_at, memo: CC_BUYBACK_MEMO.to_string() }.data(),
+    }
+}
+
+/// The address lookup table CC publishes and freezes. Every entry is a constant
+/// — programs, sysvars, and CC's own accounts — so the table never needs
+/// extending for a new prize or a new user.
+fn plant_alt(w: &mut World, v: &V2World, addresses: Vec<Pubkey>) -> AddressLookupTableAccount {
+    let key = Pubkey::new_unique();
+    let _ = v;
+    // LOOKUP_TABLE_META_SIZE is a fixed 56 bytes: bincode enum tag (4) +
+    // deactivation_slot (8) + last_extended_slot (8) + start_index (1) +
+    // Option<Pubkey> authority (1 tag + 32, occupied even when None) +
+    // padding (2). Addresses begin at 56.
+    let mut data = Vec::new();
+    data.extend_from_slice(&1u32.to_le_bytes()); // ProgramState::LookupTable
+    data.extend_from_slice(&u64::MAX.to_le_bytes()); // deactivation_slot = never
+    data.extend_from_slice(&0u64.to_le_bytes()); // last_extended_slot
+    // Addresses are only usable once current_slot > last_extended_slot;
+    // before that only addresses[0..start_index] count as active. A frozen,
+    // long-published table has every address predating its last extension, so
+    // start_index is the full length — which is also what makes this usable at
+    // litesvm's genesis slot.
+    data.push(addresses.len() as u8); // last_extended_slot_start_index
+    data.push(0); // authority = None — FROZEN, which is the whole point
+    data.extend_from_slice(&[0u8; 32]); // the authority's slot, unused when None
+    data.extend_from_slice(&[0u8; 2]); // padding
+    assert_eq!(data.len(), 56, "lookup table meta must be exactly 56 bytes");
+    for a in &addresses {
+        data.extend_from_slice(a.as_ref());
+    }
+    w.svm.set_account(key, solana_sdk::account::Account {
+        lamports: 10_000_000_000,
+        data,
+        owner: solana_sdk::address_lookup_table::program::ID,
+        executable: false,
+        rent_epoch: 0,
+    }).unwrap();
+    AddressLookupTableAccount { key, addresses }
+}
+
+/// The legacy form MUST be over budget. Pinned so nobody "simplifies" the
+/// client back to a legacy transaction and discovers this in production.
+#[test]
+fn buyback_pnft_v2_legacy_tx_is_over_budget() {
+    let mut w = setup(true);
+    let v = setup_v2(&mut w);
+    let p = mint_prize_to_vault(&mut w);
+    let price = 10_000_000u64;
+
+    let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO);
+    let tx = Transaction::new_signed_with_payer(
+        &[cc_ed25519_ix(&v.quote_signer, &digest),
+          ComputeBudgetInstruction::set_compute_unit_limit(500_000),
+          buyback_pnft_v2_ix(&w, &v, &p, price, 1, i64::MAX),
+          memo_ix(CC_BUYBACK_MEMO)],
+        Some(&w.hot.pubkey()), &[&w.hot], w.svm.latest_blockhash());
+
+    let size = 1 + 64 + tx.message_data().len();
+    println!("buyback_pnft_v2 as a LEGACY transaction: {size} bytes (cap {PACKET_DATA_SIZE})");
+    assert!(size > PACKET_DATA_SIZE,
+        "legacy now fits ({size} <= {PACKET_DATA_SIZE}) — the ALT may no longer be needed, revisit the client contract");
+}
+
+/// The v0 form with CC's frozen lookup table, and the full swap executing.
+#[test]
+fn buyback_pnft_v2_v0_atomic_swap_and_packet_budget() {
+    let mut w = setup(true);
+    let v = setup_v2(&mut w);
+    let p = mint_prize_to_vault(&mut w);
+    let price = 10_000_000u64;
+
+    // Everything constant across every buyback goes in the table. The prize,
+    // the vault and the destination stay static: a new prize wallet must never
+    // require extending a frozen table.
+    let cc_op = w.cc_operator.pubkey();
+    let alt = plant_alt(&mut w, &v, vec![
+        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
+        cc_op,
+        v.usdc_mint,
+        v.cc_usdc,
+        CC_RULE_SET,
+        AUTH_RULES_PROGRAM_ID,
+        mpl_token_metadata::ID,
+        solana_sdk::sysvar::instructions::ID,
+        ATA_PROGRAM_ID,
+        CC_BUYBACK_ID,
+        v.cc_policy,
+        TOKEN_PROGRAM_ID,
+        system_program::ID,
+    ]);
+
+    let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO);
+    let ixs = vec![
+        cc_ed25519_ix(&v.quote_signer, &digest),
+        ComputeBudgetInstruction::set_compute_unit_limit(500_000),
+        buyback_pnft_v2_ix(&w, &v, &p, price, 1, i64::MAX),
+        memo_ix(CC_BUYBACK_MEMO),
+    ];
+    let msg = v0::Message::try_compile(&w.hot.pubkey(), &ixs, &[alt], w.svm.latest_blockhash())
+        .expect("v0 compile against the lookup table");
+    let vtx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&w.hot]).unwrap();
+
+    let size = bincode_len(&vtx);
+    println!("buyback_pnft_v2 as a V0 transaction with the ALT: {size} bytes (cap {PACKET_DATA_SIZE})");
+    assert!(size <= PACKET_DATA_SIZE, "v0 + ALT must fit one packet ({size} > {PACKET_DATA_SIZE})");
+
+    let vault_usdc_before = spl_amount(&w, &v.vault_usdc);
+    w.svm.send_transaction(vtx).expect("v0 atomic buyback should land");
+
+    assert_eq!(spl_amount(&w, &v.vault_usdc), vault_usdc_before + price, "vault was not paid");
+    assert_eq!(spl_amount(&w, &ata(&v.destination, &p.mint)), 1, "prize did not reach the destination");
+    // Replay protection is cc_buyback's marker now, not a counter here.
+    let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO);
+    assert!(
+        w.svm.get_account(&cc_quote_marker_pda(&digest)).is_some_and(|a| !a.data.is_empty()),
+        "cc_buyback did not mark the quote spent",
+    );
+    assert_eq!(get_vault(&w).buyback_nonce, 0, "v2 must not touch buyback_nonce — it is layout padding now");
+    assert!(w.svm.get_account(&p.token).map_or(true, |a| a.data.is_empty()),
+        "prize ATA should have been closed");
+}
+
+/// CC is not a signer, so the phone's is the only signature on the wire.
+#[test]
+fn buyback_pnft_v2_needs_only_the_phone_signature() {
+    let mut w = setup(true);
+    let v = setup_v2(&mut w);
+    let p = mint_prize_to_vault(&mut w);
+    let ix = buyback_pnft_v2_ix(&w, &v, &p, 10_000_000, 1, i64::MAX);
+    let signers: Vec<Pubkey> = ix.accounts.iter().filter(|m| m.is_signer).map(|m| m.pubkey).collect();
+    assert_eq!(signers, vec![w.hot.pubkey()], "someone other than the phone must sign");
+}
+
+/// A quote naming a destination CC has not allow-listed. In v1 this slot held
+/// `rejects_a_stale_nonce`; the vault no longer keeps a counter, so the
+/// equivalent guard is cc_buyback's own — covered by
+/// `a_returned_asset_cannot_be_bought_twice_with_one_quote` in cc_buyback_v2.rs.
+#[test]
+fn buyback_pnft_v2_rejects_an_unlisted_destination() {
+    let mut w = setup(true);
+    let mut v = setup_v2(&mut w);
+    let p = mint_prize_to_vault(&mut w);
+    let price = 10_000_000u64;
+
+    // Re-point the quote (and the instruction) at a destination the policy does
+    // not list. The digest still verifies; cc_buyback refuses on the allow-list.
+    v.destination = Pubkey::new_unique();
+    let digest = cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO);
+    let cc_op = w.cc_operator.pubkey();
+    let alt = plant_alt(&mut w, &v, vec![
+        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0, cc_op,
+        v.usdc_mint, v.cc_usdc, CC_RULE_SET, AUTH_RULES_PROGRAM_ID, mpl_token_metadata::ID,
+        solana_sdk::sysvar::instructions::ID, ATA_PROGRAM_ID, CC_BUYBACK_ID, v.cc_policy,
+        TOKEN_PROGRAM_ID, system_program::ID,
+    ]);
+    let ixs = vec![
+        cc_ed25519_ix(&v.quote_signer, &digest),
+        ComputeBudgetInstruction::set_compute_unit_limit(500_000),
+        buyback_pnft_v2_ix(&w, &v, &p, price, 1, i64::MAX),
+    ];
+    let msg = v0::Message::try_compile(&w.hot.pubkey(), &ixs, &[alt], w.svm.latest_blockhash()).unwrap();
+    let vtx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&w.hot]).unwrap();
+
+    assert!(w.svm.send_transaction(vtx).is_err(), "an unlisted destination was accepted");
+    assert_eq!(spl_amount(&w, &p.token), 1, "prize moved on a rejected buyback");
+}
+
+fn bincode_len(tx: &VersionedTransaction) -> usize {
+    // Same accounting the legacy assertions use: shortvec(sig count) + 64 per
+    // signature + the serialized message.
+    let msg = tx.message.serialize();
+    1 + tx.signatures.len() * 64 + msg.len()
 }

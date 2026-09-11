@@ -161,8 +161,9 @@ fn setup() -> World {
     let (config, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint: mint,
-        gacha_wallet: gacha_owner.pubkey(),
+        rent_destination: gacha_owner.pubkey(),
         gacha_usdc_account: gacha_usdc,
         fee_usdc_account: fee_usdc,
         fee_bps: 0,
@@ -170,6 +171,7 @@ fn setup() -> World {
         _reserved: false,
         allow_buyback_delegation: false,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();
@@ -208,8 +210,9 @@ fn set_config(w: &mut World, gacha_usdc_account: Pubkey, fee_usdc_account: Pubke
     let (config, bump) = Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID);
     let cfg = Config {
         admin: Pubkey::new_unique(),
+        pending_admin: Pubkey::default(),
         usdc_mint: w.mint,
-        gacha_wallet: Pubkey::new_unique(),
+        rent_destination: Pubkey::new_unique(),
         gacha_usdc_account,
         fee_usdc_account,
         fee_bps: 0,
@@ -217,6 +220,7 @@ fn set_config(w: &mut World, gacha_usdc_account: Pubkey, fee_usdc_account: Pubke
         _reserved: false,
         allow_buyback_delegation: false,
         bump,
+        _padding: [0u8; 128],
     };
     let mut data = Vec::new();
     cfg.try_serialize(&mut data).unwrap();

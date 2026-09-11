@@ -1,0 +1,5 @@
+# Pinned because platform-tools version determines SBF stack accounting: the
+# same source that builds clean on one toolchain can overflow a try_accounts
+# frame on another, and the build still exits 0. See scripts/check_fixtures.sh.
+[toolchain]
+channel = "1.91.0"

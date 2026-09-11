@@ -31,6 +31,24 @@ pub const MPL_CORE_ID: Pubkey =
 pub const AUTH_RULES_ID: Pubkey =
     anchor_lang::solana_program::pubkey!("auth9SigNpDKz4sJJ1DfCTuZrZNSAgh9sFD3rboVmgg");
 
+/// Collector Crypt's buyback authorization program. A COMPILE-TIME constant,
+/// deliberately not a Config field: no admin key can repoint the thing that
+/// decides whether a buyback was authorized.
+pub const CC_BUYBACK_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF");
+/// Seed of cc_buyback's singleton policy PDA.
+pub const CC_POLICY_SEED: &[u8] = b"policy";
+/// cc_buyback's per-quote replay marker, `[b"quote", digest]`. The digest is not
+/// known here, so the address is passed in and cc_buyback checks it itself.
+pub const CC_QUOTE_SEED: &[u8] = b"quote";
+/// cc_buyback's rent vault, `[b"rent"]` — it funds the marker, so the phone does
+/// not have to.
+pub const CC_RENT_VAULT_SEED: &[u8] = b"rent";
+/// sha256("global:authorize_and_pay")[..8]. Hand-encoded rather than taken as a
+/// Cargo dependency, matching how the mpl-core CPIs are built here; the
+/// integration tests pin the byte sequence so a rename on CC's side fails loudly.
+pub const CC_AUTHORIZE_AND_PAY_IX: [u8; 8] = [196, 1, 233, 204, 98, 232, 22, 54];
+
 /// Per-user delegated-custody vault for the Collector Crypt Gacha integration.
 ///
 /// Integration facts this design is built on:
@@ -89,26 +107,22 @@ pub const AUTH_RULES_ID: Pubkey =
 ///       only; `revoke_buyback` and `update_vault` (rotate key) are the
 ///       reactive controls.
 ///   (c) co-sign `buyback_pnft` / `buyback_core` (see below).
-/// - Tangem admin key: config only, but `config.gacha_wallet` is NOT merely a
-///   payment address — it is an ASSET-CUSTODY authority. It is the `address =`
-///   pin on `cc_authority`, i.e. it names the only key that may execute a
-///   buyback — one that sends the prize to an UNCONSTRAINED `destination_owner`
-///   of that signer's choosing, for pNFTs and for Core alike. So admin + hot
-///   together can move ANY prize out of ANY vault, to any address, at any
-///   `price > 0`, with no cold-key tap: `price` has no on-chain floor, the caps
-///   do not apply, and the one-live-delegate slot does not either. In
-///   particular Core prizes are no longer cold-only — before these
-///   instructions, `withdraw_core` was their sole exit. Hold the admin key in a
-///   multisig (Squads) — that is a prerequisite, not a nicety — and alarm on
-///   `ConfigUpdated`, treating a change to ANY of `gacha_wallet`,
-///   `gacha_usdc_account` or `fee_usdc_account` as break-glass. Incident levers,
-///   in order of bluntness: repoint `gacha_wallet` (disables both buybacks
-///   globally and moves the sweep rent away, while spins keep working, since
-///   `open_pack` pins the separate `gacha_usdc_account`); `paused` (stops spins
-///   and buybacks for everyone); per vault, a cold-key `update_vault` hot
-///   rotation. `allow_buyback_delegation` gates `approve_buyback` ONLY and is
-///   not a brake on the atomic buybacks.
-///   The admin key also reaches value on a SECOND, independent path: the same
+/// - Tangem admin key: config only. `config.rent_destination` (formerly
+///   `gacha_wallet`) is now just that — where CC's fronted prize-ATA rent goes
+///   back. It is NOT an asset-custody authority: buybacks are authorized by a
+///   CC-signed quote verified against the cc_buyback policy, so no key held by
+///   Tangem, and no key held by CC either, can move a prize on its own
+///   signature. `price` is bound to the quote, `destination_owner` must be on
+///   CC's on-chain allow-list, and each quote is spendable once against
+///   cc_buyback's own `[b"quote", digest]` marker. Hold the admin key in a
+///   multisig (Squads) — still a prerequisite — and alarm on `ConfigUpdated`,
+///   treating a change to `gacha_usdc_account` or `fee_usdc_account` as
+///   break-glass. Incident levers, in order of bluntness: CC's own `set_paused`
+///   on the buyback policy (stops buybacks globally while spins keep working);
+///   `paused` here (stops spins and buybacks for everyone); per vault, a
+///   cold-key `update_vault` hot rotation. `allow_buyback_delegation` gates
+///   `approve_buyback` ONLY and is not a brake on the atomic buybacks.
+///   The admin key still reaches value on a SECOND, independent path: the same
 ///   one-signature `update_config` rewrites `gacha_usdc_account` and
 ///   `fee_usdc_account`, and those two pins are the only destination checks
 ///   `open_pack` performs. One admin write therefore diverts 100% of every
@@ -128,7 +142,7 @@ pub mod tangem_gacha_vault {
     /// this (prevents config-admin front-running between deploy and init).
     pub fn initialize_config(
         ctx: Context<InitializeConfig>,
-        gacha_wallet: Pubkey,
+        rent_destination: Pubkey,
         gacha_usdc_account: Pubkey,
         fee_usdc_account: Pubkey,
         fee_bps: u16,
@@ -150,8 +164,9 @@ pub mod tangem_gacha_vault {
         );
         let config = &mut ctx.accounts.config;
         config.admin = ctx.accounts.admin.key();
+        config.pending_admin = Pubkey::default();
         config.usdc_mint = ctx.accounts.usdc_mint.key();
-        config.gacha_wallet = gacha_wallet;
+        config.rent_destination = rent_destination;
         config.gacha_usdc_account = gacha_usdc_account;
         config.fee_usdc_account = fee_usdc_account;
         config.fee_bps = fee_bps;
@@ -159,15 +174,20 @@ pub mod tangem_gacha_vault {
         config._reserved = false;
         config.allow_buyback_delegation = allow_buyback_delegation;
         config.bump = ctx.bumps.config;
+        config._padding = [0u8; 128];
         Ok(())
     }
 
     /// Admin-only partial updates of the global config.
+    ///
+    /// `pending_admin` NOMINATES a successor; it does not hand over. The
+    /// nominee must call `accept_admin`. Passing the default pubkey cancels a
+    /// pending nomination.
     #[allow(clippy::too_many_arguments)]
     pub fn update_config(
         ctx: Context<UpdateConfig>,
-        new_admin: Option<Pubkey>,
-        gacha_wallet: Option<Pubkey>,
+        pending_admin: Option<Pubkey>,
+        rent_destination: Option<Pubkey>,
         gacha_usdc_account: Option<Pubkey>,
         fee_usdc_account: Option<Pubkey>,
         fee_bps: Option<u16>,
@@ -175,11 +195,11 @@ pub mod tangem_gacha_vault {
         allow_buyback_delegation: Option<bool>,
     ) -> Result<()> {
         let config = &mut ctx.accounts.config;
-        if let Some(v) = new_admin {
-            config.admin = v;
+        if let Some(v) = pending_admin {
+            config.pending_admin = v;
         }
-        if let Some(v) = gacha_wallet {
-            config.gacha_wallet = v;
+        if let Some(v) = rent_destination {
+            config.rent_destination = v;
         }
         if let Some(v) = gacha_usdc_account {
             config.gacha_usdc_account = v;
@@ -199,12 +219,29 @@ pub mod tangem_gacha_vault {
         }
         emit!(ConfigUpdated {
             admin: config.admin,
-            gacha_wallet: config.gacha_wallet,
+            pending_admin: config.pending_admin,
+            rent_destination: config.rent_destination,
             gacha_usdc_account: config.gacha_usdc_account,
             fee_usdc_account: config.fee_usdc_account,
             fee_bps: config.fee_bps,
             paused: config.paused,
             allow_buyback_delegation: config.allow_buyback_delegation,
+        });
+        Ok(())
+    }
+
+    /// Second half of the admin handover: the nominee claims the role. Until
+    /// this lands the sitting admin is unchanged, so a nomination sent to a
+    /// mistyped or unusable address costs nothing and is cancelled by
+    /// nominating the default pubkey.
+    pub fn accept_admin(ctx: Context<AcceptAdmin>) -> Result<()> {
+        let config = &mut ctx.accounts.config;
+        let previous = config.admin;
+        config.admin = ctx.accounts.pending_admin.key();
+        config.pending_admin = Pubkey::default();
+        emit!(AdminTransferred {
+            previous,
+            current: config.admin,
         });
         Ok(())
     }
@@ -230,9 +267,10 @@ pub mod tangem_gacha_vault {
         vault.daily_cap = daily_cap;
         vault.spent_today = 0;
         vault.day_index = Clock::get()?.unix_timestamp.div_euclid(SECONDS_PER_DAY);
-        vault._reserved = 0;
+        vault.buyback_nonce = 0;
         vault.live_buyback_mint = None;
         vault.live_buyback_token = None;
+        vault._padding = [0u8; 128];
         vault.bump = ctx.bumps.vault;
         emit!(VaultInitialized {
             vault: vault.key(),
@@ -791,6 +829,260 @@ pub mod tangem_gacha_vault {
         Ok(())
     }
 
+    /// Buyback of a Metaplex Core prize, authorized by a CC-signed quote
+    /// instead of a CC signature on the transaction.
+    ///
+    /// What changes versus `buyback_core`: Collector Crypt no longer signs
+    /// anything here. The transaction carries a top-level ed25519 instruction
+    /// holding CC's detached quote; this program CPIs into `cc_buyback`, which
+    /// verifies that quote against its own policy and moves the payment. So
+    /// `config.rent_destination` stops being an asset-custody authority, `price`
+    /// is bound to the quote rather than merely `> 0`, `destination_owner` must
+    /// be on CC's destination allow-list, and cc_buyback's own quote marker
+    /// makes the quote
+    /// spendable exactly once.
+    ///
+    /// The phone still co-signs, so the user still approves the specific price,
+    /// and it is now also the fee payer and the mpl-core rent payer.
+    ///
+    /// CLIENT CONTRACT: prepend the ed25519 quote instruction CC returned, and
+    /// display the `price` ARGUMENT — not the quote the API rendered.
+    pub fn buyback_core_v2(
+        ctx: Context<BuybackCoreV2>,
+        price: u64,
+        quote_id: u64,
+        expires_at: i64,
+        memo: String,
+    ) -> Result<()> {
+        require!(!ctx.accounts.config.paused, VaultError::Paused);
+        require!(price > 0, VaultError::ZeroAmount);
+        require!(
+            !memo.is_empty() && memo.len() <= MAX_MEMO_LEN,
+            VaultError::InvalidMemo
+        );
+        require_keys_eq!(
+            ctx.accounts.cc_program.key(),
+            CC_BUYBACK_ID,
+            VaultError::CcProgramMismatch
+        );
+
+        let cold_owner = ctx.accounts.vault.cold_owner;
+        let vault_bump = ctx.accounts.vault.bump;
+        let seeds: &[&[u8]] = &[VAULT_SEED, cold_owner.as_ref(), &[vault_bump]];
+
+        // ASSET FIRST, then money. cc_buyback v2 reads the processed-sibling
+        // list and refuses to pay unless this transfer has already completed, so
+        // the v1 ordering would simply fail. The transaction is atomic either
+        // way: if the payout reverts, so does this transfer.
+        //
+        // mpl-core TransferV1, same wire format as withdraw_core, except the
+        // phone pays the rent — CC is not a signer on this transaction at all.
+        let metas = vec![
+            AccountMeta::new(ctx.accounts.asset.key(), false),
+            AccountMeta::new_readonly(ctx.accounts.collection.key(), false),
+            AccountMeta::new(ctx.accounts.hot_delegate.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.vault.key(), true),
+            AccountMeta::new_readonly(ctx.accounts.destination_owner.key(), false),
+            AccountMeta::new_readonly(MPL_CORE_ID, false),
+            AccountMeta::new_readonly(MPL_CORE_ID, false),
+        ];
+        let ix = Instruction {
+            program_id: MPL_CORE_ID,
+            accounts: metas,
+            data: vec![14, 0],
+        };
+        invoke_signed(
+            &ix,
+            &[
+                ctx.accounts.asset.to_account_info(),
+                ctx.accounts.collection.to_account_info(),
+                ctx.accounts.hot_delegate.to_account_info(),
+                ctx.accounts.vault.to_account_info(),
+                ctx.accounts.destination_owner.to_account_info(),
+                ctx.accounts.mpl_core_program.to_account_info(),
+            ],
+            &[seeds],
+        )?;
+
+        // Now the money. cc_buyback verifies the transfer above as a processed
+        // sibling, checks the lane's float and the signed quote, marks the quote
+        // spent, and pays the vault's USDC account.
+        cc_authorize_and_pay(
+            &ctx.accounts.cc_program.to_account_info(),
+            &ctx.accounts.cc_policy.to_account_info(),
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.asset.to_account_info(),
+            &ctx.accounts.destination_owner.to_account_info(),
+            &ctx.accounts.cc_usdc.to_account_info(),
+            &ctx.accounts.vault_usdc.to_account_info(),
+            &ctx.accounts.usdc_mint.to_account_info(),
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            &ctx.accounts.cc_quote_marker.to_account_info(),
+            &ctx.accounts.cc_rent_vault.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            price,
+            quote_id,
+            expires_at,
+            &memo,
+            seeds,
+        )?;
+
+        emit!(BuybackExecuted {
+            vault: ctx.accounts.vault.key(),
+            mint: ctx.accounts.asset.key(),
+            price,
+            memo,
+        });
+        Ok(())
+    }
+
+    /// Buyback of a prize pNFT, authorized by a CC-signed quote.
+    ///
+    /// Same change as `buyback_core_v2`: Collector Crypt signs a detached quote
+    /// rather than this transaction, so `price` is bound to that signature,
+    /// `destination_owner` must be on CC's on-chain allow-list, and
+    /// cc_buyback's own quote marker makes it spendable once. The phone is the
+    /// only signer, and pays the fee and the Metaplex rent.
+    ///
+    /// CLIENT CONTRACT — this instruction carries 24 accounts and does NOT fit
+    /// a legacy transaction. Build a v0 transaction against CC's frozen address
+    /// lookup table, prepend the ed25519 quote instruction, request ~500k
+    /// compute units, and create the vault's USDC ATA idempotently if it may
+    /// not exist. Display the `price` ARGUMENT, not the quote the API rendered.
+    pub fn buyback_pnft_v2(
+        ctx: Context<BuybackPnftV2>,
+        price: u64,
+        quote_id: u64,
+        expires_at: i64,
+        memo: String,
+    ) -> Result<()> {
+        require_auth_rules_program(&ctx.accounts.authorization_rules_program)?;
+        require!(!ctx.accounts.config.paused, VaultError::Paused);
+        require!(price > 0, VaultError::ZeroAmount);
+        require!(
+            !memo.is_empty() && memo.len() <= MAX_MEMO_LEN,
+            VaultError::InvalidMemo
+        );
+        require!(ctx.accounts.nft_token.amount == 1, VaultError::NotAnNft);
+        require!(
+            ctx.accounts.nft_mint.key() != ctx.accounts.config.usdc_mint,
+            VaultError::NotAnNft
+        );
+        require_keys_eq!(
+            ctx.accounts.cc_program.key(),
+            CC_BUYBACK_ID,
+            VaultError::CcProgramMismatch
+        );
+
+        // Copied out so the seed slice holds no borrow of `vault` across the
+        // nonce increment between the two CPIs.
+        let cold_owner = ctx.accounts.vault.cold_owner;
+        let vault_bump = ctx.accounts.vault.bump;
+        let seeds: &[&[u8]] = &[VAULT_SEED, cold_owner.as_ref(), &[vault_bump]];
+
+        // ASSET FIRST, then money — see buyback_core_v2. cc_buyback v2 will not
+        // pay until it can see this transfer as a processed sibling.
+        let tmp = ctx.accounts.token_metadata_program.to_account_info();
+        let vault_info = ctx.accounts.vault.to_account_info();
+        let mint_info = ctx.accounts.nft_mint.to_account_info();
+        let token_info = ctx.accounts.nft_token.to_account_info();
+        let dest_token_info = ctx.accounts.destination_token.to_account_info();
+        let dest_owner_info = ctx.accounts.destination_owner.to_account_info();
+        let metadata_info = ctx.accounts.metadata.to_account_info();
+        let edition_info = ctx.accounts.edition.to_account_info();
+        let token_record_info = ctx.accounts.token_record.to_account_info();
+        let dest_token_record_info = ctx.accounts.destination_token_record.to_account_info();
+        // The phone pays, not CC — CC is not a signer on this transaction.
+        let payer_info = ctx.accounts.hot_delegate.to_account_info();
+        let system_info = ctx.accounts.system_program.to_account_info();
+        let sysvar_info = ctx.accounts.sysvar_instructions.to_account_info();
+        let token_program_info = ctx.accounts.token_program.to_account_info();
+        let ata_program_info = ctx.accounts.ata_program.to_account_info();
+        let auth_rules_info = ctx
+            .accounts
+            .authorization_rules
+            .as_ref()
+            .map(|a| a.to_account_info());
+        let auth_rules_program_info = ctx
+            .accounts
+            .authorization_rules_program
+            .as_ref()
+            .map(|a| a.to_account_info());
+
+        TransferV1CpiBuilder::new(&tmp)
+            .token(&token_info)
+            .token_owner(&vault_info)
+            .destination_token(&dest_token_info)
+            .destination_owner(&dest_owner_info)
+            .mint(&mint_info)
+            .metadata(&metadata_info)
+            .edition(Some(&edition_info))
+            .token_record(Some(&token_record_info))
+            .destination_token_record(Some(&dest_token_record_info))
+            .authority(&vault_info)
+            .payer(&payer_info)
+            .system_program(&system_info)
+            .sysvar_instructions(&sysvar_info)
+            .spl_token_program(&token_program_info)
+            .spl_ata_program(&ata_program_info)
+            .authorization_rules_program(auth_rules_program_info.as_ref())
+            .authorization_rules(auth_rules_info.as_ref())
+            .amount(1)
+            .invoke_signed(&[seeds])?;
+
+        // Close the emptied prize ATA into CC, which fronted its rent at
+        // delivery. Unchanged from v1.
+        token_interface::close_account(CpiContext::new_with_signer(
+            ctx.accounts.token_program.to_account_info(),
+            CloseAccount {
+                account: ctx.accounts.nft_token.to_account_info(),
+                destination: ctx.accounts.cc_authority.to_account_info(),
+                authority: ctx.accounts.vault.to_account_info(),
+            },
+            &[seeds],
+        ))?;
+
+        // A pending approve_buyback for this token is consumed by the
+        // owner-path transfer above — free the slot so it cannot wedge.
+        if ctx.accounts.vault.live_buyback_token == Some(ctx.accounts.nft_token.key()) {
+            ctx.accounts.vault.live_buyback_mint = None;
+            ctx.accounts.vault.live_buyback_token = None;
+        }
+
+        // Now the money. `nft_mint` is the asset id the quote names for a pNFT,
+        // and it is what cc_buyback matches against the sibling transfer's mint
+        // slot.
+        cc_authorize_and_pay(
+            &ctx.accounts.cc_program.to_account_info(),
+            &ctx.accounts.cc_policy.to_account_info(),
+            &ctx.accounts.vault.to_account_info(),
+            &ctx.accounts.nft_mint.to_account_info(),
+            &ctx.accounts.destination_owner.to_account_info(),
+            &ctx.accounts.cc_usdc.to_account_info(),
+            &ctx.accounts.vault_usdc.to_account_info(),
+            &ctx.accounts.usdc_mint.to_account_info(),
+            &ctx.accounts.sysvar_instructions.to_account_info(),
+            &ctx.accounts.cc_quote_marker.to_account_info(),
+            &ctx.accounts.cc_rent_vault.to_account_info(),
+            &ctx.accounts.system_program.to_account_info(),
+            &ctx.accounts.token_program.to_account_info(),
+            price,
+            quote_id,
+            expires_at,
+            &memo,
+            seeds,
+        )?;
+
+        emit!(BuybackExecuted {
+            vault: ctx.accounts.vault.key(),
+            mint: ctx.accounts.nft_mint.key(),
+            price,
+            memo,
+        });
+        Ok(())
+    }
+
     /// Cold-key-only: withdraw a fungible SPL asset (USDC) from the vault to
     /// any destination token account (other than the source itself).
     pub fn withdraw_token(ctx: Context<WithdrawToken>, amount: u64) -> Result<()> {
@@ -1153,6 +1445,92 @@ fn require_auth_rules_program(account: &Option<UncheckedAccount>) -> Result<()> 
     Ok(())
 }
 
+/// CPI into `cc_buyback::authorize_and_pay` v2.
+///
+/// The asset must ALREADY have moved to `destination_owner` when this runs:
+/// cc_buyback reads the processed-sibling list and refuses to pay otherwise. So
+/// both v2 handlers transfer first and call this second — the reverse of v1,
+/// which paid first and relied on the caller to deliver afterwards.
+///
+/// `seller_nonce` is gone from the ABI. Replay is cc_buyback's job now, via a
+/// `[b"quote", digest]` marker account, so this program keeps no counter and
+/// `Vault.buyback_nonce` is vestigial.
+///
+/// Hand-encoded, like the mpl-core CPIs, so the two repos share no Cargo
+/// dependency and can be audited and released independently.
+#[allow(clippy::too_many_arguments)]
+fn cc_authorize_and_pay<'info>(
+    cc_program: &AccountInfo<'info>,
+    policy: &AccountInfo<'info>,
+    seller_authority: &AccountInfo<'info>,
+    asset: &AccountInfo<'info>,
+    destination_owner: &AccountInfo<'info>,
+    treasury_token: &AccountInfo<'info>,
+    seller_token: &AccountInfo<'info>,
+    payment_mint: &AccountInfo<'info>,
+    sysvar_instructions: &AccountInfo<'info>,
+    quote_marker: &AccountInfo<'info>,
+    rent_vault: &AccountInfo<'info>,
+    system_program: &AccountInfo<'info>,
+    token_program: &AccountInfo<'info>,
+    price: u64,
+    quote_id: u64,
+    expires_at: i64,
+    memo: &str,
+    vault_seeds: &[&[u8]],
+) -> Result<()> {
+    let mut data = Vec::with_capacity(8 + 8 + 8 + 8 + 4 + memo.len());
+    data.extend_from_slice(&CC_AUTHORIZE_AND_PAY_IX);
+    data.extend_from_slice(&price.to_le_bytes());
+    data.extend_from_slice(&quote_id.to_le_bytes());
+    data.extend_from_slice(&expires_at.to_le_bytes());
+    data.extend_from_slice(&(memo.len() as u32).to_le_bytes());
+    data.extend_from_slice(memo.as_bytes());
+
+    let ix = Instruction {
+        program_id: CC_BUYBACK_ID,
+        accounts: vec![
+            AccountMeta::new_readonly(policy.key(), false),
+            // The vault PDA signs here, via the invoke_signed below. cc_buyback
+            // no longer inspects its owner — there is no caller allow-list. What
+            // authorises the payout is the signed quote plus the delivered card.
+            AccountMeta::new_readonly(seller_authority.key(), true),
+            AccountMeta::new_readonly(asset.key(), false),
+            AccountMeta::new_readonly(destination_owner.key(), false),
+            AccountMeta::new(treasury_token.key(), false),
+            AccountMeta::new(seller_token.key(), false),
+            AccountMeta::new_readonly(payment_mint.key(), false),
+            AccountMeta::new_readonly(sysvar_instructions.key(), false),
+            AccountMeta::new(quote_marker.key(), false),
+            AccountMeta::new(rent_vault.key(), false),
+            AccountMeta::new_readonly(system_program.key(), false),
+            AccountMeta::new_readonly(token_program.key(), false),
+        ],
+        data,
+    };
+
+    invoke_signed(
+        &ix,
+        &[
+            policy.clone(),
+            seller_authority.clone(),
+            asset.clone(),
+            destination_owner.clone(),
+            treasury_token.clone(),
+            seller_token.clone(),
+            payment_mint.clone(),
+            sysvar_instructions.clone(),
+            quote_marker.clone(),
+            rent_vault.clone(),
+            system_program.clone(),
+            token_program.clone(),
+            cc_program.clone(),
+        ],
+        &[vault_seeds],
+    )?;
+    Ok(())
+}
+
 fn compute_fee(amount: u64, fee_bps: u16) -> Result<u64> {
     (amount as u128)
         .checked_mul(fee_bps as u128)
@@ -1195,16 +1573,23 @@ fn charge_spending(vault: &mut Account<Vault>, total: u64) -> Result<()> {
 #[derive(InitSpace)]
 pub struct Config {
     pub admin: Pubkey,
+    /// Nominated admin, or the default pubkey when no handover is pending.
+    /// Handover is two-step so a mistyped address cannot brick governance:
+    /// the sitting admin keeps its powers until the nominee calls
+    /// `accept_admin`.
+    pub pending_admin: Pubkey,
     pub usdc_mint: Pubkey,
-    /// CC's operator wallet. LOAD-BEARING FOR CUSTODY, not just for routing:
-    /// it is the rent destination of `sweep_prize_ata` AND the `address =` pin
-    /// on `cc_authority`, i.e. the only key that may execute a buyback — one
-    /// that sends the prize to an unconstrained `destination_owner` of the
-    /// signer's choosing. Admin-writable in one step, so admin +
-    /// a vault's hot key can move that vault's prizes out at any price > 0.
-    /// Repointing it is also the surgical way to disable both buybacks
-    /// globally without stopping spins.
-    pub gacha_wallet: Pubkey,
+    /// Where CC's fronted prize-ATA rent goes back: the `sweep_prize_ata`
+    /// destination, and the account that receives the closed prize ATA's
+    /// lamports during a buyback.
+    ///
+    /// It is NOT a custody authority. Buybacks are authorized by a CC-signed
+    /// quote verified against the cc_buyback policy, not by a signature from
+    /// this key, so repointing it moves where rent lands and nothing else.
+    /// The old name `gacha_wallet` described a field that was simultaneously a
+    /// payment address and the only key able to move a user's prize; that
+    /// second role is gone.
+    pub rent_destination: Pubkey,
     /// Exact USDC token account that receives spin payments. Admin-writable in
     /// one step, and it is the ONLY destination check `open_pack` performs —
     /// repointing it silently diverts every future spin payment, from every
@@ -1230,6 +1615,12 @@ pub struct Config {
     /// has migrated to those, which retires the standing-delegate drain risk.
     pub allow_buyback_delegation: bool,
     pub bump: u8,
+    /// Growth room. Config was previously allocated at exactly
+    /// `8 + INIT_SPACE`, and with no realloc, no migration instruction, an
+    /// `init`-only constructor at fixed seeds and no close, that made every
+    /// future field impossible. Reserved before the first mainnet Config
+    /// exists, because after that it cannot be.
+    pub _padding: [u8; 128],
 }
 
 #[account]
@@ -1248,9 +1639,23 @@ pub struct Vault {
     pub spent_today: u64,
     /// UTC day bucket (unix_timestamp / 86400) for `spent_today`.
     pub day_index: i64,
-    /// Layout padding left by a removed legacy field; kept so already-deployed
-    /// vaults stay layout-compatible. Always 0.
-    pub _reserved: u64,
+    /// Monotonic counter binding each buyback quote to one spend. CC signs the
+    /// value it read here; `buyback_*_v2` requires the quote to carry the
+    /// current value and increments it, so a quote is spendable exactly once.
+    ///
+    /// This is why no per-quote marker account is needed. "The asset left the
+    /// vault" is not a sufficient guard on its own: CC's webhook re-pools a
+    /// card the moment a buyback confirms, so a player can win the same card
+    /// back inside the quote TTL and the original quote would replay at a
+    /// stale price — and `buyback_core` closes nothing, so it leaves no
+    /// residue at all. At 10k buybacks/day a marker account would cost roughly
+    /// $700k–$1.1M a year in rent; a counter costs nothing and, being
+    /// per-vault, takes no shared write lock.
+    ///
+    /// Occupies the bytes of the former `_reserved: u64`, which was dead
+    /// padding always written 0 — so the layout is unchanged and every
+    /// existing vault already reads as nonce 0.
+    pub buyback_nonce: u64,
     /// Mint of the single pNFT whose transfer delegate is currently live.
     /// approve_buyback fails while occupied. Freed by revoke_buyback, by
     /// clear_buyback_slot (with on-chain proof the NFT left / delegate gone),
@@ -1265,6 +1670,10 @@ pub struct Vault {
     /// or no delegate — a decoy same-mint vault account cannot forge completion.
     pub live_buyback_token: Option<Pubkey>,
     pub bump: u8,
+    /// Growth room, for the same reason as `Config::_padding`. A Vault is
+    /// per-user, so adding a field later would mean a cold-card tap per user
+    /// even if a migration instruction existed.
+    pub _padding: [u8; 128],
 }
 
 // ---------------------------------------------------------------------------
@@ -1304,6 +1713,20 @@ pub struct UpdateConfig<'info> {
 }
 
 #[derive(Accounts)]
+pub struct AcceptAdmin<'info> {
+    #[account(
+        mut,
+        seeds = [CONFIG_SEED],
+        bump = config.bump,
+        constraint = config.pending_admin == pending_admin.key() @ VaultError::Unauthorized,
+    )]
+    pub config: Account<'info, Config>,
+    /// The nominee. Must sign, which is what proves the nominated address is
+    /// controllable — the failure mode a one-step handover cannot catch.
+    pub pending_admin: Signer<'info>,
+}
+
+#[derive(Accounts)]
 pub struct InitVault<'info> {
     #[account(
         init,
@@ -1336,18 +1759,28 @@ pub struct ColdAuthority<'info> {
 
 #[derive(Accounts)]
 pub struct OpenPack<'info> {
+    // Typed accounts are Boxed. This is the widest UNBOXED context in the
+    // program — four InterfaceAccounts plus two Accounts — and on
+    // platform-tools v1.52 its generated `try_accounts` frame overflows the
+    // 4 KB SBF stack by 8 bytes. The toolchain only WARNS and still emits the
+    // .so, and in that artifact `config.paused` deserializes as true from a
+    // zero byte, so every spin aborts with error 6000 (caps suite 8/8 -> 2/8).
+    // Boxing moves the deserialized structs to the heap and buys the frame
+    // back permanently, exactly as BuybackPnft already does. See also the
+    // hard `Stack offset` gate in scripts/check_fixtures.sh, which now fails
+    // the build instead of printing SKIPPED.
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     #[account(
         mut,
         seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
         bump = vault.bump,
         has_one = hot_delegate
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
     pub hot_delegate: Signer<'info>,
     #[account(address = config.usdc_mint)]
-    pub usdc_mint: InterfaceAccount<'info, Mint>,
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
     /// Pinned to the vault's CANONICAL ATA (not just any vault-owned USDC
     /// account).
     #[account(
@@ -1356,13 +1789,13 @@ pub struct OpenPack<'info> {
         associated_token::authority = vault,
         associated_token::token_program = token_program,
     )]
-    pub vault_usdc: InterfaceAccount<'info, TokenAccount>,
+    pub vault_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     /// Whitelisted Collector Crypt treasury account — the ONLY spin
     /// destination the hot delegate can pay. The mint pin turns a wrong-mint
     /// address in the config into a loud first-spin failure
     /// (ConstraintTokenMint, 2014) instead of a token-program error mid-CPI.
     #[account(mut, address = config.gacha_usdc_account, token::mint = usdc_mint)]
-    pub gacha_usdc: InterfaceAccount<'info, TokenAccount>,
+    pub gacha_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     /// The mint pin matters MOST here: while `fee_bps = 0` the fee transfer is
     /// skipped, so without it a wrong-mint `fee_usdc_account` in the config
     /// would pass silently for as long as the fee stays zero — and then break
@@ -1370,7 +1803,7 @@ pub struct OpenPack<'info> {
     /// first spin makes the misconfiguration visible at rollout, when it is
     /// still one `update_config` away from harmless.
     #[account(mut, address = config.fee_usdc_account, token::mint = usdc_mint)]
-    pub fee_usdc: InterfaceAccount<'info, TokenAccount>,
+    pub fee_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     pub token_program: Interface<'info, TokenInterface>,
 }
 
@@ -1497,7 +1930,7 @@ pub struct BuybackPnft<'info> {
     /// The CC operator wallet fixed in the config: pays the refund, the fees
     /// and the rent; receives the closed ATA's whole lamport balance. The NFT
     /// itself goes to `destination_owner`.
-    #[account(mut, address = config.gacha_wallet)]
+    #[account(mut, address = config.rent_destination)]
     pub cc_authority: Signer<'info>,
     /// CHECK: the wallet that receives the NFT — CC's free per-transaction
     /// choice (prizes return to rotating prize wallets, not to the operator
@@ -1565,19 +1998,24 @@ pub struct BuybackPnft<'info> {
 
 #[derive(Accounts)]
 pub struct BuybackCore<'info> {
+    // Boxed for the same reason as BuybackPnft and OpenPack: this context's
+    // generated try_accounts frame exceeded the 4 KB SBF stack by 48 bytes
+    // once Config and Vault gained growth padding. The toolchain only warns
+    // and still writes the .so, so the overflow ships silently — see the hard
+    // gate in scripts/check_fixtures.sh.
     #[account(seeds = [CONFIG_SEED], bump = config.bump)]
-    pub config: Account<'info, Config>,
+    pub config: Box<Account<'info, Config>>,
     #[account(
         seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
         bump = vault.bump,
         has_one = hot_delegate
     )]
-    pub vault: Account<'info, Vault>,
+    pub vault: Box<Account<'info, Vault>>,
     /// User consent to the offered price.
     pub hot_delegate: Signer<'info>,
     /// The CC operator wallet fixed in the config: pays the refund and the
     /// fees. The asset itself goes to `destination_owner`.
-    #[account(mut, address = config.gacha_wallet)]
+    #[account(mut, address = config.rent_destination)]
     pub cc_authority: Signer<'info>,
     /// CHECK: the wallet that receives the asset — CC's free per-transaction
     /// choice (prizes return to rotating prize wallets, not to the operator
@@ -1586,11 +2024,11 @@ pub struct BuybackCore<'info> {
     /// user's protection is the price, which the hot key co-signs.
     pub destination_owner: UncheckedAccount<'info>,
     #[account(address = config.usdc_mint)]
-    pub usdc_mint: InterfaceAccount<'info, Mint>,
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
     /// CC's USDC account the refund is paid from (its authority is
     /// `cc_authority` — enforced by the token program on the transfer).
     #[account(mut)]
-    pub cc_usdc: InterfaceAccount<'info, TokenAccount>,
+    pub cc_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     /// The vault's CANONICAL USDC ATA — the only place the refund can land.
     #[account(
         mut,
@@ -1598,7 +2036,7 @@ pub struct BuybackCore<'info> {
         associated_token::authority = vault,
         associated_token::token_program = token_program,
     )]
-    pub vault_usdc: InterfaceAccount<'info, TokenAccount>,
+    pub vault_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
     /// CHECK: Core AssetV1 account — owner pinned here, contents and ownership
     /// validated by the mpl-core CPI (it refuses to transfer an asset the vault
     /// does not own).
@@ -1614,6 +2052,174 @@ pub struct BuybackCore<'info> {
     #[account(address = MPL_CORE_ID)]
     pub mpl_core_program: UncheckedAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
+}
+
+/// 24 accounts. Does NOT fit a legacy transaction — the client must build a v0
+/// transaction with the frozen address lookup table CC publishes. See
+/// `buyback_pnft_v2_legacy_tx_is_over_budget`, which pins that fact so the
+/// dependency cannot regress silently.
+///
+/// As with BuybackCoreV2, `cc_authority` is no longer a signer: Collector Crypt
+/// signs a quote, not this transaction. It stays in the account list because
+/// the emptied prize ATA is still closed into it — CC fronted that rent at
+/// delivery.
+#[derive(Accounts)]
+pub struct BuybackPnftV2<'info> {
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        bump = vault.bump,
+        has_one = hot_delegate
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    /// User consent to the offered price. Also fee payer, TransferV1 payer and
+    /// destination-ATA rent payer.
+    #[account(mut)]
+    pub hot_delegate: Signer<'info>,
+    /// CHECK: receives the closed prize ATA's lamports. Not a signer.
+    #[account(mut, address = config.rent_destination)]
+    pub cc_authority: UncheckedAccount<'info>,
+    /// CHECK: pinned by cc_buyback against CC's on-chain allow-list, and bound
+    /// into the signed quote.
+    pub destination_owner: UncheckedAccount<'info>,
+    #[account(address = config.usdc_mint)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CC's treasury token account; cc_buyback pulls from it as spl-token
+    /// delegate, leaving its owner unchanged.
+    #[account(mut)]
+    pub cc_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = vault,
+        associated_token::token_program = token_program,
+    )]
+    pub vault_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    pub nft_mint: Box<InterfaceAccount<'info, Mint>>,
+    #[account(mut, token::authority = vault, token::mint = nft_mint)]
+    pub nft_token: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: destination ATA — created by the Token Metadata CPI when missing.
+    #[account(mut)]
+    pub destination_token: UncheckedAccount<'info>,
+    /// CHECK: Metadata PDA — validated by the Token Metadata CPI.
+    #[account(mut)]
+    pub metadata: UncheckedAccount<'info>,
+    /// CHECK: Master edition PDA — validated by the Token Metadata CPI.
+    pub edition: UncheckedAccount<'info>,
+    /// CHECK: source TokenRecord PDA — validated by the CPI.
+    #[account(mut)]
+    pub token_record: UncheckedAccount<'info>,
+    /// CHECK: destination TokenRecord PDA — validated by the CPI.
+    #[account(mut)]
+    pub destination_token_record: UncheckedAccount<'info>,
+    /// CHECK: optional auth-rules account — validated by the CPI.
+    pub authorization_rules: Option<UncheckedAccount<'info>>,
+    /// CHECK: pinned to AUTH_RULES_ID in the handler. ABSENT is encoded by
+    /// passing THIS PROGRAM's id; the slot is not last, so it must be filled.
+    pub authorization_rules_program: Option<UncheckedAccount<'info>>,
+    /// CHECK: pinned to the Token Metadata program id.
+    #[account(address = mpl_token_metadata::ID)]
+    pub token_metadata_program: UncheckedAccount<'info>,
+    /// CHECK: pinned to the instructions sysvar. Carries the ed25519 quote that
+    /// cc_buyback reads.
+    #[account(address = sysvar::instructions::ID)]
+    pub sysvar_instructions: UncheckedAccount<'info>,
+    /// CHECK: pinned to the associated token program id.
+    #[account(address = anchor_spl::associated_token::ID)]
+    pub ata_program: UncheckedAccount<'info>,
+    /// CHECK: pinned in the handler to CC_BUYBACK_ID.
+    pub cc_program: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's policy PDA; its own seeds constraint pins which
+    /// account it must be.
+    #[account(owner = CC_BUYBACK_ID @ VaultError::CcPolicyMismatch)]
+    pub cc_policy: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's `[b"quote", digest]` marker. Not derivable here — the
+    /// digest is recomputed inside cc_buyback — so cc_buyback verifies the
+    /// address. Empty on the way in; cc_buyback allocates it.
+    #[account(mut)]
+    pub cc_quote_marker: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's `[b"rent"]` vault, which fronts the marker's rent so
+    /// the phone does not pay for CC's bookkeeping.
+    #[account(mut, seeds = [CC_RENT_VAULT_SEED], bump, seeds::program = CC_BUYBACK_ID)]
+    pub cc_rent_vault: UncheckedAccount<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
+}
+
+/// 15 accounts, fits a legacy transaction with room to spare.
+///
+/// Note what is ABSENT compared to `BuybackCore`: `cc_authority`. Collector
+/// Crypt signs a quote, not this transaction, so it needs no account here and
+/// `config.rent_destination` is no longer load-bearing for custody. Core assets
+/// have no token account, so there is no rent to return either.
+#[derive(Accounts)]
+pub struct BuybackCoreV2<'info> {
+    // Boxed, as everywhere else that holds Config or Vault: both carry growth
+    // padding now and will not fit a 4 KB frame unboxed.
+    #[account(seeds = [CONFIG_SEED], bump = config.bump)]
+    pub config: Box<Account<'info, Config>>,
+    #[account(
+        mut,
+        seeds = [VAULT_SEED, vault.cold_owner.as_ref()],
+        bump = vault.bump,
+        has_one = hot_delegate
+    )]
+    pub vault: Box<Account<'info, Vault>>,
+    /// User consent to the offered price. Also fee payer and mpl-core rent payer.
+    #[account(mut)]
+    pub hot_delegate: Signer<'info>,
+    /// CHECK: where the asset goes. Unconstrained HERE because cc_buyback pins
+    /// it against CC's on-chain allow-list, and the same value is bound into the
+    /// signed quote — two independent checks, neither of them this program's.
+    pub destination_owner: UncheckedAccount<'info>,
+    #[account(address = config.usdc_mint)]
+    pub usdc_mint: Box<InterfaceAccount<'info, Mint>>,
+    /// CC's treasury token account. Its authority is cc_buyback's policy PDA,
+    /// acting as an spl-token delegate; the account's OWNER stays CC's wallet,
+    /// which is what keeps CC's webhook reconciliation matching.
+    #[account(mut)]
+    pub cc_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// The vault's canonical USDC ATA — the only place the payment can land.
+    #[account(
+        mut,
+        associated_token::mint = usdc_mint,
+        associated_token::authority = vault,
+        associated_token::token_program = token_program,
+    )]
+    pub vault_usdc: Box<InterfaceAccount<'info, TokenAccount>>,
+    /// CHECK: Core AssetV1 — ownership validated by the mpl-core CPI.
+    #[account(mut, owner = MPL_CORE_ID)]
+    pub asset: UncheckedAccount<'info>,
+    /// CHECK: the asset's Core collection; mpl-core binds it to the asset.
+    pub collection: UncheckedAccount<'info>,
+    /// CHECK: pinned to the mpl-core program id.
+    #[account(address = MPL_CORE_ID)]
+    pub mpl_core_program: UncheckedAccount<'info>,
+    /// CHECK: pinned in the handler to CC_BUYBACK_ID.
+    pub cc_program: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's policy PDA. The owner check is here; cc_buyback's own
+    /// `seeds = [b"policy"]` constraint pins which account it must be, so a
+    /// different cc_buyback-owned account is rejected there rather than passing
+    /// silently.
+    #[account(owner = CC_BUYBACK_ID @ VaultError::CcPolicyMismatch)]
+    pub cc_policy: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's `[b"quote", digest]` marker. Not derivable here — the
+    /// digest is recomputed inside cc_buyback — so cc_buyback verifies the
+    /// address. Empty on the way in; cc_buyback allocates it.
+    #[account(mut)]
+    pub cc_quote_marker: UncheckedAccount<'info>,
+    /// CHECK: cc_buyback's `[b"rent"]` vault, which fronts the marker's rent so
+    /// the phone does not pay for CC's bookkeeping.
+    #[account(mut, seeds = [CC_RENT_VAULT_SEED], bump, seeds::program = CC_BUYBACK_ID)]
+    pub cc_rent_vault: UncheckedAccount<'info>,
+    /// CHECK: pinned to the instructions sysvar. cc_buyback reads the ed25519
+    /// quote instruction through it.
+    #[account(address = sysvar::instructions::ID)]
+    pub sysvar_instructions: UncheckedAccount<'info>,
+    pub token_program: Interface<'info, TokenInterface>,
+    pub system_program: Program<'info, System>,
 }
 
 #[derive(Accounts)]
@@ -1743,7 +2349,7 @@ pub struct SweepPrizeAta<'info> {
     #[account(mut, token::authority = vault)]
     pub token: InterfaceAccount<'info, TokenAccount>,
     /// CHECK: rent destination, pinned to the CC gacha wallet from the config.
-    #[account(mut, address = config.gacha_wallet)]
+    #[account(mut, address = config.rent_destination)]
     pub rent_destination: UncheckedAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
 }
@@ -1797,12 +2403,19 @@ pub struct HotDelegateRotated {
 #[event]
 pub struct ConfigUpdated {
     pub admin: Pubkey,
-    pub gacha_wallet: Pubkey,
+    pub pending_admin: Pubkey,
+    pub rent_destination: Pubkey,
     pub gacha_usdc_account: Pubkey,
     pub fee_usdc_account: Pubkey,
     pub fee_bps: u16,
     pub paused: bool,
     pub allow_buyback_delegation: bool,
+}
+
+#[event]
+pub struct AdminTransferred {
+    pub previous: Pubkey,
+    pub current: Pubkey,
 }
 
 #[event]
@@ -1851,7 +2464,7 @@ pub struct TokenAccountClosed {
 pub struct PrizeAtaSwept {
     pub vault: Pubkey,
     pub token_account: Pubkey,
-    /// Lamports forwarded to `config.gacha_wallet` — exactly the closed
+    /// Lamports forwarded to `config.rent_destination` — exactly the closed
     /// account's rent-exempt minimum. Anything the account held above it stays
     /// in the vault.
     pub rent_refund: u64,
@@ -1935,4 +2548,10 @@ pub enum VaultError {
     ExcessLamports,
     #[msg("USDC mint must be a legacy SPL Token mint")]
     UnsupportedMint,
+    #[msg("Quote nonce does not match the vault's current buyback nonce")]
+    StaleQuoteNonce,
+    #[msg("cc_program is not the Collector Crypt buyback program")]
+    CcProgramMismatch,
+    #[msg("cc_policy is not owned by the Collector Crypt buyback program")]
+    CcPolicyMismatch,
 }
