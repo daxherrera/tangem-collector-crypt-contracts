@@ -36,6 +36,10 @@ pub const AUTH_RULES_ID: Pubkey =
 /// decides whether a buyback was authorized.
 pub const CC_BUYBACK_ID: Pubkey =
     anchor_lang::solana_program::pubkey!("CcBuyM7sDhedBGLZxivBvgZVdqzrQAG66KYHgnTTEpLF");
+/// SPL Memo v3. cc_buyback CPIs it so the settling transaction carries a memo
+/// instruction like every other transaction in CC's system; forwarded here.
+pub const CC_MEMO_ID: Pubkey =
+    anchor_lang::solana_program::pubkey!("MemoSq4gqABAXKb96qnH8TysNcWxMyWCqXgDLGmfcHr");
 /// Seed of cc_buyback's singleton policy PDA.
 pub const CC_POLICY_SEED: &[u8] = b"policy";
 /// cc_buyback's per-quote replay marker, `[b"quote", digest]`. The digest is not
@@ -921,6 +925,7 @@ pub mod tangem_gacha_vault {
             &ctx.accounts.cc_rent_vault.to_account_info(),
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.cc_memo_program.to_account_info(),
             price,
             quote_id,
             expires_at,
@@ -1067,6 +1072,7 @@ pub mod tangem_gacha_vault {
             &ctx.accounts.cc_rent_vault.to_account_info(),
             &ctx.accounts.system_program.to_account_info(),
             &ctx.accounts.token_program.to_account_info(),
+            &ctx.accounts.cc_memo_program.to_account_info(),
             price,
             quote_id,
             expires_at,
@@ -1473,6 +1479,7 @@ fn cc_authorize_and_pay<'info>(
     rent_vault: &AccountInfo<'info>,
     system_program: &AccountInfo<'info>,
     token_program: &AccountInfo<'info>,
+    memo_program: &AccountInfo<'info>,
     price: u64,
     quote_id: u64,
     expires_at: i64,
@@ -1505,6 +1512,7 @@ fn cc_authorize_and_pay<'info>(
             AccountMeta::new(rent_vault.key(), false),
             AccountMeta::new_readonly(system_program.key(), false),
             AccountMeta::new_readonly(token_program.key(), false),
+            AccountMeta::new_readonly(memo_program.key(), false),
         ],
         data,
     };
@@ -1524,6 +1532,7 @@ fn cc_authorize_and_pay<'info>(
             rent_vault.clone(),
             system_program.clone(),
             token_program.clone(),
+            memo_program.clone(),
             cc_program.clone(),
         ],
         &[vault_seeds],
@@ -2144,6 +2153,10 @@ pub struct BuybackPnftV2<'info> {
     /// the phone does not pay for CC's bookkeeping.
     #[account(mut, seeds = [CC_RENT_VAULT_SEED], bump, seeds::program = CC_BUYBACK_ID)]
     pub cc_rent_vault: UncheckedAccount<'info>,
+    /// CHECK: SPL Memo, forwarded to cc_buyback which pins it. Last in cc_buyback's
+    /// account list, so this is an append — no earlier meta shifts.
+    #[account(address = CC_MEMO_ID)]
+    pub cc_memo_program: UncheckedAccount<'info>,
     pub token_program: Interface<'info, TokenInterface>,
     pub system_program: Program<'info, System>,
 }
@@ -2214,6 +2227,10 @@ pub struct BuybackCoreV2<'info> {
     /// the phone does not pay for CC's bookkeeping.
     #[account(mut, seeds = [CC_RENT_VAULT_SEED], bump, seeds::program = CC_BUYBACK_ID)]
     pub cc_rent_vault: UncheckedAccount<'info>,
+    /// CHECK: SPL Memo, forwarded to cc_buyback which pins it. Last in cc_buyback's
+    /// account list, so this is an append — no earlier meta shifts.
+    #[account(address = CC_MEMO_ID)]
+    pub cc_memo_program: UncheckedAccount<'info>,
     /// CHECK: pinned to the instructions sysvar. cc_buyback reads the ed25519
     /// quote instruction through it.
     #[account(address = sysvar::instructions::ID)]

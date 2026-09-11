@@ -132,6 +132,7 @@ fn setup() -> World {
         quote_signer.pubkey(),
         &[destination],
         &[CcLane { mint, treasury: cc_treasury }],
+        cc_wallet.pubkey(),
     );
     // cc_buyback fronts the quote marker's rent from its own PDA, so the phone
     // never pays for CC's bookkeeping. Unfunded, every buyback fails.
@@ -232,6 +233,7 @@ fn buyback_ix(w: &World, price: u64, quote_id: u64, expires_at: i64) -> Instruct
         accounts: accounts::BuybackCoreV2 {
             cc_quote_marker: cc_quote_marker_pda(&digest),
             cc_rent_vault: cc_rent_vault_pda().0,
+            cc_memo_program: tangem_gacha_vault::CC_MEMO_ID,
             config: w.config,
             vault: w.vault,
             hot_delegate: w.hot.pubkey(),

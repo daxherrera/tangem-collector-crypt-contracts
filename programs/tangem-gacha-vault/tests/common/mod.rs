@@ -161,6 +161,7 @@ pub fn plant_cc_policy(
     quote_signer: Pubkey,
     destinations: &[Pubkey],
     lanes: &[CcLane],
+    rent_destination: Pubkey,
 ) {
     let mut d = Vec::new();
     d.extend_from_slice(&CC_POLICY_DISC);
@@ -184,7 +185,10 @@ pub fn plant_cc_policy(
             None => d.extend_from_slice(&[0u8; 64]),
         }
     }
-    d.extend_from_slice(&[0u8; 256]); // _padding
+    // Where cc_buyback demands the prize ATA's rent be returned. It reads this
+    // off ITS policy, not our config, so our admin cannot redirect CC's refund.
+    d.extend_from_slice(rent_destination.as_ref());
+    d.extend_from_slice(&[0u8; 224]); // _padding
 
     svm.set_account(
         policy,

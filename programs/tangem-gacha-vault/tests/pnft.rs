@@ -1906,6 +1906,7 @@ fn setup_v2(w: &mut World) -> V2World {
         quote_signer.pubkey(),
         &[destination],
         &[CcLane { mint: usdc_mint, treasury: cc_usdc }],
+        w.cc_operator.pubkey(),
     );
 
     // cc_buyback fronts the quote marker's rent from its own PDA, so the phone
@@ -1933,6 +1934,7 @@ fn buyback_pnft_v2_ix(w: &World, v: &V2World, p: &Prize, price: u64, quote_id: u
         accounts: accounts::BuybackPnftV2 {
             cc_quote_marker: cc_quote_marker_pda(&digest),
             cc_rent_vault: cc_rent_vault_pda().0,
+            cc_memo_program: tangem_gacha_vault::CC_MEMO_ID,
             config: Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
             vault: w.vault,
             hot_delegate: w.hot.pubkey(),
@@ -2080,6 +2082,71 @@ fn buyback_pnft_v2_v0_atomic_swap_and_packet_budget() {
     assert_eq!(get_vault(&w).buyback_nonce, 0, "v2 must not touch buyback_nonce — it is layout padding now");
     assert!(w.svm.get_account(&p.token).map_or(true, |a| a.data.is_empty()),
         "prize ATA should have been closed");
+}
+
+/// CC fronted this prize's ATA rent at delivery, and cc_buyback will not pay
+/// unless it comes back to the address CC's OWN policy names. Reading this
+/// program's source is not the guarantee — it can be redeployed — so the same
+/// swap is run with cc_buyback pointed at a different rent destination and must
+/// be refused. Everything else is identical to the passing case, so the only
+/// reachable failure is the rent check.
+#[test]
+fn buyback_pnft_v2_rejects_rent_sent_to_the_wrong_wallet() {
+    let mut w = setup(true);
+    let v = setup_v2(&mut w);
+    let p = mint_prize_to_vault(&mut w);
+    let price = 10_000_000u64;
+
+    // Same destination, same lane, same signer — only rent_destination moves.
+    let (cc_policy, cc_bump) = cc_policy_pda();
+    plant_cc_policy(
+        &mut w.svm,
+        cc_policy,
+        cc_bump,
+        v.quote_signer.pubkey(),
+        &[v.destination],
+        &[CcLane { mint: v.usdc_mint, treasury: v.cc_usdc }],
+        Pubkey::new_unique(),
+    );
+
+    let cc_op = w.cc_operator.pubkey();
+    let alt = plant_alt(&mut w, &v, vec![
+        Pubkey::find_program_address(&[CONFIG_SEED], &PROGRAM_ID).0,
+        cc_op,
+        v.usdc_mint,
+        v.cc_usdc,
+        CC_RULE_SET,
+        AUTH_RULES_PROGRAM_ID,
+        mpl_token_metadata::ID,
+        solana_sdk::sysvar::instructions::ID,
+        ATA_PROGRAM_ID,
+        CC_BUYBACK_ID,
+        v.cc_policy,
+        TOKEN_PROGRAM_ID,
+        system_program::ID,
+    ]);
+
+    let ixs = vec![
+        ComputeBudgetInstruction::set_compute_unit_limit(500_000),
+        cc_ed25519_ix(
+            &v.quote_signer,
+            &cc_quote_digest(&w.vault, &p.mint, &v.destination, &v.usdc_mint, price, i64::MAX, 1, CC_BUYBACK_MEMO),
+        ),
+        buyback_pnft_v2_ix(&w, &v, &p, price, 1, i64::MAX),
+        memo_ix(CC_BUYBACK_MEMO),
+    ];
+    let msg = v0::Message::try_compile(&w.hot.pubkey(), &ixs, &[alt], w.svm.latest_blockhash())
+        .expect("v0 compile against the lookup table");
+    let vtx = VersionedTransaction::try_new(VersionedMessage::V0(msg), &[&w.hot]).unwrap();
+
+    let err = w.svm.send_transaction(vtx).expect_err("rent went elsewhere; must not pay");
+    let logs = err.meta.logs.join("\n");
+    assert!(
+        logs.contains("RentNotReturned"),
+        "expected RentNotReturned, got:\n{logs}"
+    );
+    // And nothing moved.
+    assert_eq!(spl_amount(&w, &v.vault_usdc), 0, "vault must not have been paid");
 }
 
 /// CC is not a signer, so the phone's is the only signature on the wire.
